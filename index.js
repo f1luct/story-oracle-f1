@@ -1183,6 +1183,50 @@ function buildFixSelOverlayHtml(text, ranges) {
     return html + esc(t.slice(pos));
 }
 
+// 纯函数（点选模式）：选哪个模式。存过的偏好（'tap' / 'drag'）恒赢；没存过才看 coarse pointer
+//（无悬停 + 粗指针 = 手机/平板 → 点选，否则拖选）。偏好只住 localStorage，绝不进 extensionSettings
+//（那是跨设备同步的，手机上的选择会翻掉桌面）。其余取值一律当「没存过」。可单测。
+function fixSelPickMode(storedPref, coarsePointer) {
+    if (storedPref === 'tap' || storedPref === 'drag') return storedPref;
+    return coarsePointer ? 'tap' : 'drag';
+}
+
+// 纯函数（点选模式）：点选层 HTML。切点 = 每个单元首尾 ∪ 草稿两端 ∪ 每个钉段两端，排序后两两成片；
+// 每片一个 <span>，恒带【切句时就算好的】raw UTF-16 偏移 data-s / data-e —— 偏移从不靠搜索显示文字
+// 找回（sol 警告：画出来的高亮绝不能变成第二个真相源）。落在 prose 单元里的片带 data-i + role=option
+//（同一单元被草稿/钉边切成几片时，几片共享同一个 data-i）；gap 片是素片、不可点。草稿内加
+// so-fixsel-u-hl、钉段内加 so-fixsel-u-pin，钉段的【第一片】带 data-badge（1 基序号）。
+// 文本只转义 & < >；状态栏 / 更新块 / 代码围栏都是普通文字（裁定 0.1，不做块识别）。可单测。
+function buildFixSelPickerHtml(raw, units, draft, pins) {
+    const t = String(raw || '');
+    const us = Array.isArray(units) ? units : [];
+    const ps = Array.isArray(pins) ? pins : [];
+    const esc = (x) => String(x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const d = (draft && Number.isInteger(draft.start) && Number.isInteger(draft.end) && draft.end > draft.start) ? draft : null;
+    const bounds = new Set([0, t.length]);
+    for (const u of us) { bounds.add(u.start); bounds.add(u.end); }
+    if (d) { bounds.add(d.start); bounds.add(d.end); }
+    for (const p of ps) { bounds.add(p.start); bounds.add(p.end); }
+    const cuts = Array.from(bounds).filter((x) => Number.isInteger(x) && x >= 0 && x <= t.length).sort((a, b) => a - b);
+    let html = '', ui = 0;
+    for (let c = 0; c + 1 < cuts.length; c++) {
+        const s = cuts[c], e = cuts[c + 1];
+        while (ui < us.length && us[ui].end <= s) ui++;
+        const unit = us[ui];
+        const pi = ps.findIndex((p) => s >= p.start && e <= p.end);
+        const cls = (d && s >= d.start && e <= d.end ? ' so-fixsel-u-hl' : '') + (pi >= 0 ? ' so-fixsel-u-pin' : '');
+        const badge = (pi >= 0 && s === ps[pi].start) ? ` data-badge="${pi + 1}"` : '';
+        const off = ` data-s="${s}" data-e="${e}"`;
+        const text = esc(t.slice(s, e));
+        if (unit && unit.kind === 'prose' && s >= unit.start && e <= unit.end) {
+            html += `<span class="so-fixsel-u${cls}" data-i="${ui}" role="option"${off}${badge}>${text}</span>`;
+        } else {
+            html += `<span${cls ? ` class="${cls.trim()}"` : ''}${off}${badge}>${text}</span>`;
+        }
+    }
+    return html;
+}
+
 // ✂️ 选段校正·主聊天入口（1.42.0）：把「渲染层划选的字符串」映射回原始 m.mes 的字符区间。阶梯（spec
 // 2026-07-27-fixsel-chat-entry）：① 精确唯一命中；② 多处命中 → 渲染层前后文打分挑一处（平手取最早）；
 // ③ 零命中 → 模糊重扫（空白串互配 + raw 侧跳过渲染层看不见的 markdown 记号）；④ 仍无 → null（开卡不预选，
@@ -1263,6 +1307,127 @@ function fuzzyScanRaw(sel, hay) {
         }
     }
     return out;
+}
+
+// ✂️ 选段校正·点选（tap-selection，手机）—— 纯函数层三件：切句表 / 点击闸门 / grapheme 表。
+// 一行 DOM 都不碰；渲染器、微调选择器与总开关在后续任务里接线。设计与共识：
+// docs/superpowers/specs/2026-09-11-fixsel-tap-mode-brainstorm/SYNTHESIS.md，真机探针 tests/_fixsel-tap-probe.html。
+
+// 切句字符集（点选）：终止符 / 尾随闭合符 / 软切逗号 / 空白 / 数字。不设 ALL_CAPS 常量——这些是切法的
+// 内部字表，不是可调阈值（可调的只有 FIXSEL_SOFT_CUT）。
+const fixSelTerms = '。！？；!?…';
+const fixSelClosers = '」』”’）)》〕】';
+const fixSelSofts = '、，,';
+const fixSelWs = /\s/;
+const fixSelDigit = /[0-9]/;
+
+// 纯函数（点选）：把整条正文【确定性地】切成一张无缝单元表 [{start,end,kind:'prose'|'gap'}]，供点选渲染器
+// 逐句渲染成可点的 DOM。切点：① 终止符连串 + 尾随闭合符之后切（「你好。」整句带引号走）；② 每个换行切、
+// 各行独立切；③ 拉丁句点只在【后接空白或行尾、且前一字符不是数字】时切（"3.5 at dawn." 只在 dawn. 后切
+// 一次）；④ 一段散文超过 FIXSEL_SOFT_CUT 字，就在 [半程, 满程) 窗口里【最后一个】、，, 处软切，窗口内无
+// 逗号则不软切。空白连串自成 gap 单元（切点后的空白也归 gap，故 ". Next" 出 散文/gap/散文 三格）。
+// 裁定 0.1：状态栏 / 机制块 / 代码围栏【不特殊】——按普通行切，可点可跨，与拖选一致。
+// 恒等式（单测钉）：units.map(u => raw.slice(u.start, u.end)).join('') === raw；首 start = 0、段段接头、
+// 尾 end = raw.length；空串 → []。偏移一律是 raw 里的 UTF-16 下标——渲染层【绝不】靠搜索文本反推位置。
+// 句级 Intl.Segmenter 有意不用：各引擎切法不同，同一条正文在不同手机上会切出不同的表。可单测。
+function fixSelUnits(raw) {
+    const text = String(raw || '');
+    const n = text.length;
+    const units = [];
+    const push = (s, e, kind) => { if (e > s) units.push({ start: s, end: e, kind }); };
+    // 一段散文：先把切点后的空白整串让给 gap，剩下的按 FIXSEL_SOFT_CUT 软切。
+    const pushProse = (s, e) => {
+        let w = s;
+        while (w < e && fixSelWs.test(text[w])) w++;
+        push(s, w, 'gap');
+        s = w;
+        if (s >= e) return;
+        let t = s;
+        while (e - t > FIXSEL_SOFT_CUT) {
+            let cut = -1;
+            for (let k = t + FIXSEL_SOFT_CUT / 2; k < t + FIXSEL_SOFT_CUT && k < e; k++) {
+                if (fixSelSofts.includes(text[k])) cut = k + 1;
+            }
+            if (cut < 0) break;
+            push(t, cut, 'prose');
+            t = cut;
+        }
+        push(t, e, 'prose');
+    };
+    let i = 0;
+    while (i < n) {
+        if (fixSelWs.test(text[i])) {                                    // 空白连串 = 一个 gap
+            let j = i;
+            while (j < n && fixSelWs.test(text[j])) j++;
+            push(i, j, 'gap');
+            i = j;
+            continue;
+        }
+        let j = i;
+        while (j < n && text[j] !== '\n' && text[j] !== '\r') j++;        // 本行 = [i, j)
+        let s = i;
+        for (let k = i; k < j; k++) {
+            const c = text[k];
+            let cut = -1;
+            if (fixSelTerms.includes(c)) {
+                let m = k + 1;
+                while (m < j && fixSelTerms.includes(text[m])) m++;       // …… 算一整串
+                while (m < j && fixSelClosers.includes(text[m])) m++;     // 闭合符跟着上一句走
+                cut = m;
+            } else if (c === '.') {
+                const prevDigit = k > 0 && fixSelDigit.test(text[k - 1]); // 3.5 不是句末
+                const nextWs = k + 1 >= j || fixSelWs.test(text[k + 1]);
+                if (!prevDigit && nextWs) {
+                    let m = k + 1;
+                    while (m < j && fixSelClosers.includes(text[m])) m++;
+                    cut = m;
+                }
+            }
+            if (cut > 0) { pushProse(s, cut); s = cut; k = cut - 1; }
+        }
+        if (s < j) pushProse(s, j);
+        i = j;
+    }
+    return units;
+}
+
+// 纯函数（点选）：点击闸门——判「这一下到底是点选还是滑动/惯性/误触」。down = 追踪到的 pointerdown 记录
+// {t,x,y,scrollTop,sinceScroll,multi,cancelled}，为 null 表示【压根没有触控记录】= 键盘 / 辅助技术激活，
+// 恒放行（可达性：闸门只管真实触控）。判定顺序固定：多指 → pointercancel → 按太久 → 位移超阈 →
+// 按下到点击之间滚动条动过 → 按下时距上次 scroll 太近（这一下多半是在刹住惯性滚动）→ 点击时距上次
+// scroll 太近。前两项之后的每个拒绝都带 dt / dist（逐手势调试日志要打这两个数）。可单测。
+function fixSelJudgeTap(down, now, click, scrollTop, lastScrollAt,
+    thr = { t: FIXSEL_TAP_MAX_MS, d: FIXSEL_TAP_MAX_PX, q: FIXSEL_SCROLL_QUIET_MS }) {
+    if (!down) return { ok: true, reason: 'no-pointer' };
+    if (down.multi) return { ok: false, reason: 'multi-pointer' };
+    if (down.cancelled) return { ok: false, reason: 'pointercancel' };
+    const dt = now - down.t;
+    const dist = Math.hypot(click.x - down.x, click.y - down.y);
+    if (dt > thr.t) return { ok: false, reason: 'too-long', dt, dist };
+    if (dist > thr.d) return { ok: false, reason: 'moved', dt, dist };
+    if (scrollTop !== down.scrollTop) return { ok: false, reason: 'scrolled', dt, dist };
+    if (down.sinceScroll < thr.q) return { ok: false, reason: 'scroll-quiet-at-down', dt, dist };
+    if (now - lastScrollAt < thr.q) return { ok: false, reason: 'scroll-quiet', dt, dist };
+    return { ok: true, dt, dist };
+}
+
+// 微调用的 Intl.Segmenter 实例：只为省掉重复构造而缓存，【可用性每次调用现查】（缓存不是判据）。
+let fixSelSegmenterCache = null;
+
+// 纯函数（点选·微调）：把 raw.slice(s, e) 切成字素格 [{start,end,g}]，start/end 是【raw 里的】UTF-16 下标
+// （= s + 段内偏移），g 是这一格的字符串。Intl.Segmenter 缺席 → 返回 null，调用方把微调置灰并说明原因，
+// 【绝不】退化成手搓拆字（ZWJ 家庭 👨‍👩‍👧 / 区域指示符旗帜 🇨🇳 必须整格不散）。可单测。
+function fixSelGraphemes(raw, s, e) {
+    if (typeof Intl === 'undefined' || !Intl.Segmenter) return null;
+    const text = String(raw || '');
+    const from = Math.max(0, Math.min(Number(s) || 0, text.length));
+    const to = Math.max(from, Math.min(Number(e) || 0, text.length));
+    if (!fixSelSegmenterCache) fixSelSegmenterCache = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    const cells = [];
+    for (const seg of fixSelSegmenterCache.segment(text.slice(from, to))) {
+        cells.push({ start: from + seg.index, end: from + seg.index + seg.segment.length, g: seg.segment });
+    }
+    return cells;
 }
 
 // 纯函数：勾选目标 + 非空约束 → 校正指令。T1 总附；T2 仅当依据上下文在场（八股需卡+前文、对话需卡、魔法需世界书）。
@@ -1565,6 +1730,16 @@ const ENABLE_SEQ_PULSE = true;
 // 读点：init 监听注册 + onPromptReadyGlue（入口闸，含 glueNote('flag-off') 那一枝）。无用户开关（Prince 2026-09-02）。
 const ENABLE_INJECT_GLUE = true;
 
+// 🧭 数据库联动（1.78.0；设计记录 docs/superpowers/specs/2026-09-12-guidance-provider-debate-synthesis.md）：SP·数据库 的
+// 「剧情推进」规划器只读玩家末条 mes、从不读 ST 的 extension prompts，参谋引导对它是盲区（Discord 浮游刃 2026-09-12）。
+// 三明治：GENERATION_AFTER_COMMANDS 上 makeFirst 把当前引导按标记附到玩家末条 mes（只给它的规划器看）、makeLast 剥回；
+// 出站提示词与「只装数据库」逐字节相同。附带只读快照口 window.StoryOracleAPI.guidance.getActive()。
+// 运行期 opt-in 设置 dbBridge（参谋条「数据库联动（实验）」勾选框，默认关）——Prince 2026-09-12 定：修法必须躲在勾选框后面。
+// false → 勾选框不渲染、监听器不登记、接口对象无 guidance 键、applyPlanInjection 不发布——出站字节与 1.77.5 全同。
+// 读点：init 监听注册 · dbBridgeAfterCommandsFirst 入口闸 · dbBridgeSweep · applyPlanInjection 发布步 · soExposeHookApi ·
+// 参谋条模板 / bind / refresh。单测 db-bridge.test.mjs。
+const ENABLE_DB_BRIDGE = true;
+
 // 📋 自定义模板任务（spec 2026-09-03）：校正模式第三档「自定义」——用户自存模板接管「每条新回复」的校正槽位
 // （与校正互斥；「沿用校正的正文识别」可关）。false ⇒ 下拉无第三档、自定义键惰性、出站字节与 1.76.0 全同。
 const ENABLE_FIX_CUSTOM_TASK = true;
@@ -1743,11 +1918,26 @@ const ENABLE_FIX_SELECT = true;
 // ST 服务逐请求独立 promise —— 皆可并行，中转限流靠这个帽 + 逐段 fail-open + 「重试失败段」兜）。
 const MULTIFIX_MAX_PINS = 8;
 const MULTIFIX_CONCURRENCY = 3;
+// ✂️ 选段校正·点选（tap-selection，手机）四个阈值。前三个是点击闸门的默认档（fixSelJudgeTap 的默认
+// thr；探针在真机上按这套跑通），最后一个是切句的软切长度。
+const FIXSEL_TAP_MAX_MS = 400;      // 点选闸门：按下到抬起 ≤ 400 ms
+const FIXSEL_TAP_MAX_PX = 10;       // 点选闸门：位移 ≤ 10 px
+const FIXSEL_SCROLL_QUIET_MS = 120; // 点选闸门：距上一次 scroll 事件 ≥ 120 ms（按下时与点击时都查）
+const FIXSEL_SOFT_CUT = 120;        // 切句：超过 120 字的句子在 60–120 区间最后一个 、，, 处软切
+// ✂️ 选段校正·点选·微调选择器（停靠式字素格）两个阈值。
+const FIXSEL_CH_PAGE = 24;          // 微调：一页最多摆 24 个字素格（8 列 × 3 行，每格 ≥44px）
+const FIXSEL_CH_NUDGE_WIN = 40;     // 微调：‹ 一字 / 一字 › 只在边界前后各 40 字的窗口里拆字素（够找到邻格，不白拆整篇）
 // ✂️ 选段校正·主聊天入口（1.42.0）总开关：最新 AI 楼层动作行的 ✂️ 按钮 + 划选追踪 + 预选开卡。false →
 // 按钮不注入、点击处理 no-op、selectionchange 追踪空转——主聊天字节回 1.41.x。读者：refreshFixChatEntry
 // 注入门 + onFixChatEntryClick 守卫 + onChatSelectionChange 守卫。另叠加 ENABLE_REPLY_FIX &&
 // ENABLE_FIX_SELECT（缺任一按钮不渲染——没有卡可开就不该有入口）。
 const ENABLE_FIXSEL_CHAT_ENTRY = true;
+// ✂️ 选段校正·点选模式（tap-selection，手机；设计 docs/superpowers/specs/2026-09-11-fixsel-tap-mode-brainstorm/
+// SYNTHESIS.md）：把只读 textarea 换成一层【可点的流式正文】——轻点一句 = 一段草稿，写回仍是今天那两行
+// （fixSelStored = {start,end} 后 apply()），所以信息行 / 📌 / 重叠 / 上限 / go 态全走没改过的老代码。
+// false → 点选层 / 头部切换 / 贴底操作条一件不建、一个监听不挂、localStorage 一次不碰，卡与 1.78.0 逐字节
+// 相同。读者：fixSelResolveMode（模式解析）+ buildFixSelCard（建件与布线）+ openFixSelectCard（开卡套用）。
+const ENABLE_FIX_TAP_SELECT = true;
 // ⟦记号前推⟧ 校正契约（ENABLE_FIX_FORWARD，2026-08-12；未发布、默认关）：把【手动校正】的输出契约从
 // 「整条重打一遍 <FixedReply>」换成 finalist B ——画布每行行首带一个 2 字符记号，模型正向一次成稿，
 // 原样留下的行只写记号引用 ⟦=d5⟧ / ⟦=d5..q7⟧，改写处直接写新散文，末尾 ⟦完⟧ 收尾；跳号=改写（有散文）
@@ -1821,6 +2011,12 @@ const ENABLE_LWB_BRIDGE = true;
 // false → 渲染器 renderWiEjs 恒 pass-through（字节级零变化）、设置行不渲染、布线不接——与本功能前逐字节相同。
 // 读点：renderWiEjs 门 + 设置行模板 + bind + 回填 + 三处允许调用点（普通 / 参谋 / 手动校正各经第三参传 opt-in）。
 const ENABLE_WI_EJS_RENDER = true;
+
+// 🌐 世界书范围「自定义」（ENABLE_WI_CUSTOM_PICK，1.81.0）：「世界书 / 知识库」下拉第五档——按【本聊天】记忆的
+// 多选书 + 逐条勾选，神谕只发勾选的条目（Discord 基米：全蓝灯书靠插件限流、神谕整本照发）。
+// 设计 docs/superpowers/specs/2026-09-13-wi-custom-scope-design.md。旗关：option 与 #so-wi-custom 不渲染、
+// 任何来源的 'custom' 落回 'st'、四档出站字节与上一发布版相同。
+const ENABLE_WI_CUSTOM_PICK = true;
 // 世界书「智能选书/选条」助手（ENABLE_LB_SMART_SELECT，2026-08-08）：📖 选择器工具栏里一个 🪄 入口 + 指令
 // 输入框——用户用自然语言（「把讲战争线的绿灯条目全勾上」「取消所有涉及感情戏的」）让模型产出一份勾选计划，
 // 经 B5 式预检行确认后落到现有选择器状态。只动勾选、永不动书内容——最坏勾错、一键还原。模型拿一份【派生目录】
@@ -1852,7 +2048,7 @@ const ENABLE_CUSTOM_PERSONAS = true;
 // —— 更新提醒（1.38.0）——
 // SO_VERSION 是代码内唯一版本号，必须与 manifest.json 的 version 完全一致——update-check.test.mjs
 // 有失配即红的漂移钉（发版清单：两处一起 bump）。
-const SO_VERSION = '1.77.3';
+const SO_VERSION = '1.81.0';
 // 更新提醒总开关。false → 设置面板不渲染「更新」组、开窗不检查、红点绘制器与一键更新 no-op、
 // 绑定/回填跳过——字节级零行为变化。运行期另有 opt-out 设置 updAutoCheck（默认开）。
 const ENABLE_UPDATE_CHECK = true;
@@ -2229,6 +2425,8 @@ const defaults = {
     // "ambient narrative intent" — too shallow railroads, too deep gets buried.
     advisorDepth: 4,
     seqPulse: true,
+    // 🧭 数据库联动（1.78.0，ENABLE_DB_BRIDGE）：默认关——只有装了 SP·数据库 且开着「剧情推进」的人才需要勾。
+    dbBridge: false,
     // Whether advisor mode runs THROUGH the curated preset (directive layered on
     // top, RP markers skipped) — same opt-in pattern as lorebookUsePreset.
     advisorUsePreset: false,
@@ -2667,6 +2865,11 @@ function soExposeHookApi() {
         isCompatible: (required) => soApiIsCompatible(SO_API_VERSION, required),
         onReady(cb) { try { cb(window.StoryOracleAPI); } catch (e) { console.warn('[Story Oracle] 插件 onReady 回调出错：', e); } },
         renderMarkdown: (text) => renderMarkdownOnly(text),   // showdown + DOMPurify（tables:true），与普通聊天关正则同款
+        // 🧭 1.78.0 只读快照口（能力探测，不 bump SO_API_VERSION——Prince 2026-09-12）：当前聊天已采纳的参谋引导。
+        // 返回 null | 副本 { schemaVersion:1, chatId, revision, kind:'plan'|'seq'|'arc', directive, intensity }；
+        // 只在注册成功后发布，勾选框「数据库联动」关 / 换聊天身份不符 → null。供 SP·数据库 等规划类扩展在【组装自己的
+        // 提示词之前】读取；不发事件、不接受写入。ENABLE_DB_BRIDGE=false → 无此键，接口对象与 1.77.5 全同。
+        ...(ENABLE_DB_BRIDGE ? { guidance: { getActive: () => dbBridgeGetActive() } } : {}),
         // 只读上下文构建器：与内置各模式同源。返回【未做宏替换】的文本，替换由调用方负责（同 buildSystemPrompt）。
         context: {
             getContext: () => getCtx(),
@@ -2805,6 +3008,37 @@ function init() {
                 ctx.eventSource.on(et.GENERATION_ENDED || 'generation_ended', glueGenReset);
                 ctx.eventSource.on(et.GENERATION_STOPPED || 'generation_stopped', glueGenReset);
                 ctx.eventSource.on(et.CHAT_COMPLETION_PROMPT_READY || 'chat_completion_prompt_ready', (data) => { onPromptReadyGlue(data); });
+            }
+            if (ENABLE_DB_BRIDGE) {
+                // 🧭 数据库联动（1.78.0）：三明治两枚监听器的【次序】是承重墙——ST 的 makeFirst/makeLast（public/lib/eventemitter.js）
+                // 缺席即登记、在场即挪位。只在 APP_READY 压一次不够：:8001 smoke 实测 APP_READY 之后还有 7 枚别家监听器落在我们 last
+                // 之后（酒馆助手等异步初始化；数据库本体更是从 CDN 热加载完才登记）——于是每次 GENERATION_STARTED（同一趟 Generate 里
+                // 紧接着就发 GENERATION_AFTER_COMMANDS，script.js:4240→4262）再压一次，届时该轮所有会参与的监听器都已在场；改的是另一个
+                // 事件的数组，不碰正在派发的那一个。事件名对 public/scripts/events.js 真源码钉（GENERATION_AFTER_COMMANDS 的值就是它自己的大写名）。
+                const evAfter = et.GENERATION_AFTER_COMMANDS || 'GENERATION_AFTER_COMMANDS';
+                const dbBridgeAssertOrder = () => {
+                    try {
+                        if (typeof ctx.eventSource.makeFirst === 'function') ctx.eventSource.makeFirst(evAfter, dbBridgeAfterCommandsFirst);
+                        else ctx.eventSource.on(evAfter, dbBridgeAfterCommandsFirst);
+                        if (typeof ctx.eventSource.makeLast === 'function') ctx.eventSource.makeLast(evAfter, dbBridgeAfterCommandsLast);
+                        else ctx.eventSource.on(evAfter, dbBridgeAfterCommandsLast);
+                    } catch (e) { console.warn('[Story Oracle] 数据库联动监听器登记失败：', e); }
+                };
+                dbBridgeAssertOrder();
+                ctx.eventSource.on(et.APP_READY || 'app_ready', dbBridgeAssertOrder);
+                ctx.eventSource.on(et.GENERATION_STARTED || 'generation_started', (type) => {
+                    // 新一趟宿主生成：不可能还有开着的三明治（链条按趟顺序执行；酒馆助手的嵌套生成不发宿主 GENERATION_STARTED）——上一趟中途崩掉
+                    // 的 pending / 嵌套计数在这里自愈。type='quiet' 例外：别的扩展在链条里起 Generate('quiet') 会嵌套发一次 STARTED，不能借它清零。
+                    if (type !== 'quiet') { dbBridgeRun.pending = null; dbBridgeRun.depth = 0; }
+                    if (getSettings().dbBridge) dbBridgeAssertOrder();
+                });
+                // 兜底清扫：崩在两枚监听器之间的残留标记。生成结束 / 中止只在勾选框开着或三明治开着时扫（省一趟全聊天扫描）；
+                // 切聊天那一趟在 onChatChanged 里无条件扫（勾选框已关也能清掉旧残留）。
+                const dbBridgeSweepIfArmed = (reason) => () => {
+                    if (getSettings().dbBridge || dbBridgeRun.pending) Promise.resolve(dbBridgeSweep(reason)).catch(() => {});
+                };
+                ctx.eventSource.on(et.GENERATION_ENDED || 'generation_ended', dbBridgeSweepIfArmed('generation_ended'));
+                ctx.eventSource.on(et.GENERATION_STOPPED || 'generation_stopped', dbBridgeSweepIfArmed('generation_stopped'));
             }
             // 回复后编排：每条新 AI 回复在共享锁下先自动校正、后自动诊断（各自仅在其自动模式开启时动作）。
             // 必须「即发即忘」：ST 的 eventSource.emit 会 await 监听器，直接挂上 async 的
@@ -3113,10 +3347,21 @@ function foldExtraScanText(chatForWI, extraScanText) {
  * own subject (throughline / waypoints / direction; see arcScanText).
  */
 // 把 worldInfoMode 设置映射成 buildWorldInfo() 的模式，供「要带世界书」的调用点用（'off' 由调用方门控）。
-// 'char' = 仅角色 / 对话相关世界书（排除全局 + 人设）。
+// 'char' = 仅角色 / 对话相关世界书（排除全局 + 人设）；'custom' = 本聊天勾选的条目（1.81.0，旗关时经归一落回 st）。
 function wiContextMode(s) {
-    const m = s.worldInfoMode;
-    return m === 'all' ? 'all' : (m === 'char' ? 'char' : 'st');
+    const m = wiEffectiveMode(s);
+    return m === 'all' ? 'all' : (m === 'char' ? 'char' : (m === 'custom' ? 'custom' : 'st'));
+}
+
+// 模式字符串归一（纯）：旗关时 'custom' 一律落回 'st'——不论来自设置、forceMode 还是 Hook-API 对象式调用；其余原样。
+function wiNormalizeMode(mode) {
+    if (mode === 'custom') return ENABLE_WI_CUSTOM_PICK ? 'custom' : 'st';
+    return mode;
+}
+
+// 设置里的世界书范围经归一后的有效值（纯；表单回填与 wiContextMode 共用，旗关 + 残留 custom 时下拉不留空白）。
+function wiEffectiveMode(s) {
+    return wiNormalizeMode(s ? s.worldInfoMode : undefined);
 }
 
 // 提示词模板（ST-Prompt-Template）挂在 globalThis 的执行器接口（见其 exports.ts / 柏宝书 getEjsTemplate）。
@@ -3169,6 +3414,45 @@ async function renderWiEjs(text, entry, opts) {
     return out;
 }
 
+// 🌐 世界书范围「自定义」喂料（1.81.0）：镜像 'all' 分支的输出形状（无书名抬头、\n\n 拼接），取数换成本聊天的勾选。
+//   chatId 无 / metadata 无 / 模块缺 / 范围空 → ''（fail-closed：宁少发不爆量）。
+//   首次遇到无键的书先播种（ensureWiCustomSeeded）→ 混合模式并入已选书里此刻命中的绿灯 → collectWiCustomEntries
+//   （剔 [mvu_update] 规则在 renderWiEjs 之前）→ 每条 entry 级 EJS（仅第三参 opt-in）→ 拼接 → stripMvuRuleContents。
+async function buildWiCustomBlock(extraScanText, excludeBooks, renderEjs) {
+    const chatId = wiCustomChatId();
+    if (chatId === null) return '';
+    const mod = await getWiEditApi();
+    if (!mod) return '';
+    let meta = getWiCustomMeta();
+    if (!meta) return '';
+    let allNames = [];
+    let activeNames = [];
+    try { [allNames, activeNames] = await Promise.all([getAllBookNames(), getActiveBookNames()]); } catch (e) { return ''; }
+    if (chatId !== wiCustomChatId()) return '';                // 等待期间聊天切走：这一趟不属于当前聊天，宁空不错发
+    let names = resolveLbTargetNames(meta.books, allNames, activeNames);
+    if (Array.isArray(excludeBooks) && excludeBooks.length) names = names.filter((n) => !excludeBooks.includes(n));
+    if (!names.length) return '';
+    const seeded = await ensureWiCustomSeeded(names, chatId, extraScanText);
+    if (chatId !== wiCustomChatId()) return '';
+    meta = seeded || meta;
+    let selMap = deserializeDiagSel(meta.sel);
+    if (meta.hybrid) {
+        try { selMap = mergeHybridUids(selMap, await wiCustomGreens(names, extraScanText)); } catch (e) { /* 混合失败就只用勾选 */ }
+        if (chatId !== wiCustomChatId()) return '';
+    }
+    const ordered = [];
+    for (const name of names) {
+        let data; try { data = await mod.loadWorldInfo(name); } catch (e) { continue; }   // 单本读失败 → 跳过这本
+        if (chatId !== wiCustomChatId()) return '';
+        if (!data || !data.entries) continue;
+        ordered.push({ name, entries: Object.values(data.entries) });
+    }
+    const entries = collectWiCustomEntries(selMap, ordered);
+    if (!entries.length) return '';
+    const rendered = await Promise.all(entries.map((e) => renderWiEjs(e.content.trim(), e, { renderEjs, level: 'entry' })));
+    return await stripMvuRuleContents(rendered.join('\n\n'));
+}
+
 async function buildWorldInfo(forceMode, extraScanText, opts) {
     // Hook API：允许 buildWorldInfo({ forceMode, extraScanText, excludeBooks }) 的对象式调用（api.context 用）；
     // 位置式调用（buildWorldInfo() / buildWorldInfo('char') / buildWorldInfo(mode, scan)）保持原样。
@@ -3184,10 +3468,14 @@ async function buildWorldInfo(forceMode, extraScanText, opts) {
     const renderEjs = !!(opts && opts.renderEjs);
     const ctx = getCtx();
     const s = getSettings();
-    const mode = forceMode || s.worldInfoMode;
+    const mode = wiNormalizeMode(forceMode || s.worldInfoMode);
     if (mode === 'off') return '';
 
     try {
+        if (mode === 'custom') {
+            return await buildWiCustomBlock(extraScanText, excludeBooks, renderEjs);
+        }
+
         if (mode === 'all') {
             const mod = await loadWorldInfoModule();
             if (!mod || !mod.getSortedEntries) return '';
@@ -3292,7 +3580,7 @@ async function buildWorldInfo(forceMode, extraScanText, opts) {
 async function buildWorldInfoSplit(forceMode, extraScanText, opts) {
     const ctx = getCtx();
     const s = getSettings();
-    const mode = forceMode || s.worldInfoMode;
+    const mode = wiNormalizeMode(forceMode || s.worldInfoMode);
     if (mode === 'off') return { before: '', after: '' };
 
     // 世界书 EJS 渲染（1.52.0）：仅经【第三参】从允许调用点（普通预设策展 / 手动校正预设槽）传入；默认 raw。
@@ -3304,6 +3592,10 @@ async function buildWorldInfoSplit(forceMode, extraScanText, opts) {
 
     if (mode === 'char') {
         return { before: await buildWorldInfo('char', extraScanText, { renderEjs }), after: '' };
+    }
+
+    if (mode === 'custom') {
+        return { before: await buildWorldInfo('custom', extraScanText, { renderEjs }), after: '' };
     }
 
     try {
@@ -3777,6 +4069,32 @@ function sumLbSelectedTokens(rows, filter) {
         sum += Number(r.tok) || 0;
     }
     return sum;
+}
+
+// 🌐 自定义范围的纯收集器（1.81.0）：selMap = { 书名: Set<uid> }（显式模型：缺键 / 空集合 = 这本一条不发），
+// orderedBooks = [{ name, entries }] 有序数组（书序由调用方按 resolveLbTargetNames 定）。
+// 书内按 displayIndex ?? uid；剔空正文；剔 [mvu_update] 规则（它们只喂诊断——且必须在 renderWiEjs 之前按条目剔，
+// stripMvuRuleContents 只认宏展开后的规则文本，对原始 {{user}} 规则不管用）；disable 无视（勾了就发）。
+function collectWiCustomEntries(selMap, orderedBooks) {
+    const out = [];
+    const sel = (selMap && typeof selMap === 'object') ? selMap : {};
+    for (const book of (Array.isArray(orderedBooks) ? orderedBooks : [])) {
+        if (!book || typeof book.name !== 'string') continue;
+        const want = sel[book.name];
+        if (!(want instanceof Set) || !want.size) continue;
+        const entries = (Array.isArray(book.entries) ? book.entries : [])
+            .filter((e) => e && want.has(Number(e.uid)) && typeof e.content === 'string' && e.content.trim())
+            .filter((e) => !isMvuRuleEntry(e))
+            .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)));
+        for (const e of entries) out.push(e);
+    }
+    return out;
+}
+
+// 自定义清单的单条体积：只按【正文 trim 后】估算（自定义喂的就是正文；lbEntryTokenCost 量的是带标题 / 关键词的编辑格式，会高估）。
+function wiCustomEntryCost(e) {
+    const c = e && typeof e.content === 'string' ? e.content.trim() : '';
+    return c ? estimateTokensForText(c) : 0;
 }
 
 /**
@@ -5432,6 +5750,8 @@ const SUMMARY_META_KEY = MODULE + '_summary';
 // 用户功能请求：诊断模式「精选世界书条目」按【当前聊天】持久化（与 plan/convo/summary 同风格）。
 //   形状：{ use:bool（L1 主开关）, hybrid:bool（L2 混合）, target:''（书目标，''=全部激活）, sel:{ [书名]:uid[] } }
 const DIAG_WI_META_KEY = MODULE + '_diagwi';
+// 🌐 世界书范围「自定义」按聊天记忆（1.81.0）：{ books: string[], hybrid: boolean, sel: { [书名]: uid[] } }。
+const WI_CUSTOM_META_KEY = MODULE + '_wisel';
 // ✨ 校正模式 Phase 4：把校正配置（目标 / 约束 / 上下文开关 / 自动）按【当前聊天】持久化——每个聊天记住
 // 自己的校正设定（chat A 的目标不会渗进 chat B）。形状 = 只存被覆盖的 fix* 键（其余现场回退全局 getSettings 默认）；
 // 没有任何覆盖时删键，保持元数据干净（同 setDiagWiMeta 风格）。生效配置经 getEffectiveFixCfg 合并、是校正代码的唯一读取入口。
@@ -6160,6 +6480,61 @@ function setDiagWiMeta(obj) {
     return true;
 }
 
+/* ------------------------------------------------------------------ *
+ * 🌐 世界书范围「自定义」（ENABLE_WI_CUSTOM_PICK，1.81.0）——按聊天记忆的元数据层。
+ * 没有内存镜像：清单每次渲染直接读 metadata，改选直接合并写回。
+ * 「有没有聊天」只能用 getCurrentChatId() 判（chatMetadata 没开聊天时也是常真 {}）；群聊有 id、照常支持。
+ * ------------------------------------------------------------------ */
+// 当前聊天 id；没开聊天 / 取不到 → null。
+function wiCustomChatId() {
+    try {
+        const ctx = getCtx();
+        if (ctx && typeof ctx.getCurrentChatId === 'function') {
+            const id = ctx.getCurrentChatId();
+            return (id === undefined || id === null || id === '') ? null : id;
+        }
+    } catch (e) { /* fall through */ }
+    return null;
+}
+
+// 读本聊天的自定义选择；没开聊天 / 拿不到 metadata → null（调用方 fail-closed）；有聊天无键 → 默认对象。
+function getWiCustomMeta() {
+    if (wiCustomChatId() === null) return null;
+    const md = getChatMetadataSafe();
+    if (!md) return null;
+    const m = md[WI_CUSTOM_META_KEY];
+    return {
+        books: (m && Array.isArray(m.books)) ? m.books.filter((n) => typeof n === 'string' && n) : [],
+        hybrid: !!(m && m.hybrid),
+        sel: (m && m.sel && typeof m.sel === 'object' && !Array.isArray(m.sel)) ? m.sel : {},
+    };
+}
+
+// 全默认判定（纯）：books 空 ∧ !hybrid ∧ sel **无键**。{Book:[]} 有键 = 显式「一条不发」，不是默认。
+function wiCustomIsDefault(meta) {
+    const o = meta || {};
+    const books = Array.isArray(o.books) ? o.books : [];
+    const sel = (o.sel && typeof o.sel === 'object' && !Array.isArray(o.sel)) ? o.sel : {};
+    return !books.length && !o.hybrid && !Object.keys(sel).length;
+}
+
+// 写本聊天的自定义选择（全默认 = 删键）。sel 的值是 uid 数组（有 Set 的调用方先 serializeDiagSel）。没聊天 → false。
+function setWiCustomMeta(obj) {
+    if (wiCustomChatId() === null) return false;
+    const md = getChatMetadataSafe();
+    if (!md) return false;
+    const o = obj || {};
+    const next = {
+        books: Array.isArray(o.books) ? o.books.filter((n) => typeof n === 'string' && n) : [],
+        hybrid: !!o.hybrid,
+        sel: (o.sel && typeof o.sel === 'object' && !Array.isArray(o.sel)) ? o.sel : {},
+    };
+    if (wiCustomIsDefault(next)) delete md[WI_CUSTOM_META_KEY];
+    else md[WI_CUSTOM_META_KEY] = next;
+    saveChatMetadata();
+    return true;
+}
+
 // 把内存选择 diagEntrySel 回写元数据，保留 use/hybrid/target。每次勾选 / 快捷按钮后调用。
 function persistDiagSel() {
     const cur = getDiagWiMeta();
@@ -6572,7 +6947,7 @@ function buildDirective(plan) {
 // this ST build has no setExtensionPrompt at all.
 function applyPlanInjection() {
     const ctx = getCtx();
-    if (typeof ctx.setExtensionPrompt !== 'function') return false;
+    if (typeof ctx.setExtensionPrompt !== 'function') { if (ENABLE_DB_BRIDGE) dbBridgePublish(null); return false; }
     const s = getSettings();
     const pos = (ctx.extension_prompt_types && ctx.extension_prompt_types.IN_CHAT != null)
         ? ctx.extension_prompt_types.IN_CHAT : 1;                    // IN_CHAT
@@ -6585,19 +6960,23 @@ function applyPlanInjection() {
     // substitutes internally). Either way, substitution happens at registration.
     const active = getActiveConstruct();
     let text = '';
+    let intensity = null;   // 🧭 1.78.0 快照口用：与 text 同源的强度档（盲盒拍也照带——Prince 2026-09-12）
     if (active && active.type === 'arc' && active.arc.currentBeat) {
         // ✏️ 1.71.0：customText 优先（用户整份自定义的注入；缺席＝派生的 injectedText）。
         const b = active.arc.currentBeat;
         const raw = b.customText || b.injectedText || '';
         try { text = ctx.substituteParams(raw); } catch (e) { text = raw; }
+        intensity = b.intensity || null;
     } else if (active && active.type === 'seq') {
         // 序列引导（1.72.0）：同一时间只有【当前拍】在引导主聊天——拍与单拍同形，
         // 所以走同一条 buildDirective（customText || buildDirectiveRaw，内部已 substitute）。
         // 无当前拍（全部播完 / 元数据被外力弄脏）→ 空串 = 清掉注入，绝不留半条陈旧引导。
         const b = seqActiveBeat(active.seq);
         text = b ? buildDirective(b) : '';
+        intensity = b ? (b.intensity || null) : null;
     } else if (active && active.type === 'plan') {
         text = buildDirective(active.plan);
+        intensity = active.plan.intensity || null;
     }
     try {
         let pulse = '';
@@ -6610,11 +6989,270 @@ function applyPlanInjection() {
     }
     try {
         ctx.setExtensionPrompt(ADVISOR_PROMPT_KEY, text, pos, depth, false, role);
+        // 🧭 1.78.0：注册成功才发布快照（与槽里的文本同源）；空文本 = 清掉。
+        if (ENABLE_DB_BRIDGE) {
+            dbBridgePublish(text ? { chatId: dbBridgeChatId(ctx), kind: active.type, directive: text, intensity: intensity || 'normal' } : null);
+        }
         return true;
     } catch (e) {
         console.warn('[Story Oracle] setExtensionPrompt failed:', e);
+        if (ENABLE_DB_BRIDGE) dbBridgePublish(null);
         return false;
     }
+}
+
+/* ------------------------------------------------------------------ *
+ * 🧭 数据库联动（1.78.0，ENABLE_DB_BRIDGE；设计记录 docs/superpowers/specs/2026-09-12-guidance-provider-debate-synthesis.md）
+ * SP·数据库 的「剧情推进」在 ST 的 GENERATION_AFTER_COMMANDS 里跑自己的规划模型：把玩家末条 mes 当输入（$8），
+ * 规划完再把 mes 整条改写成「模板包裹的原文 + <recall> 等标签块」——它从不读 ST 的 extension prompts，所以
+ * 参谋引导对它是盲区，两份「接下来怎么走」同到叙事者面前、它那份还在玩家回合里。三明治：
+ *   first（makeFirst）：闸全过 → 把【当前登记进槽的引导】按标记块附到玩家末条 mes 尾巴（只给它的规划器看）；
+ *   数据库的监听器：规划（读到引导）→ 改写 mes（我们的块被包进 $8）；
+ *   last（makeLast）：按标记剥回——不整条还原（那会抹掉数据库的改写），只摘我们那块。
+ * 出站提示词：贴合注入照常在 prompt_ready 贴引导，玩家末条与「只装数据库」逐字节相同（db-bridge.test.mjs）。
+ * 聊天文件在两枚监听器之间不落盘；崩在中间的残留由 dbBridgeSweep 在生成结束 / 中止 / 切聊天时按标记清掉。
+ * 消毒：数据库的占位符通道（$1…$9 $U $C sulv1-4 zhaohui、{{tag}}→<tag></tag>、{[db…]}、<if …>）只在【给规划器的副本】里
+ * 用零宽空格拆开（1.77.1 柚月垫同法）；叙事者读到的引导仍是贴合注入那份原文。
+ * 快照口 window.StoryOracleAPI.guidance.getActive()：注册成功后发布 {chatId, kind, directive, intensity}，勾选框关 /
+ * 换聊天身份不符 / 未发布 → null；revision 只在内容真变时 +1。SO_API_VERSION 不动（能力探测，Prince 2026-09-12）。
+ * 闸：flag · 设置 dbBridge · 数据库在场（window.AutoCardUpdaterAPI，两种安装形态都挂顶层窗口）· type normal ·
+ * !dryRun · !automatic_trigger · 槽里有引导 · 末条是玩家且未带标记。任一不过 = 一字不动。
+ * ------------------------------------------------------------------ */
+const DB_BRIDGE_MARK_OPEN = '⟦SO_GUIDE⟧';
+const DB_BRIDGE_MARK_CLOSE = '⟦/SO_GUIDE⟧';
+// 规划器抬头（文案待 Prince 否决权）：玩家优先条款是承重墙——没有它，数据库的规划器会把引导当硬性剧本复述成「绝对脚本」。
+const DB_BRIDGE_PLANNER_HEAD = '【已采纳的故事引导 · 仅供剧情规划参考 · 玩家的行动永远优先 · 请勿原文复述】';
+const DB_BRIDGE_ZW = '\u200B';
+// pending = 三明治开着：{ chatId, index, textarea }；depth = 同一趟里 GENERATION_AFTER_COMMANDS 的嵌套层数——酒馆助手的 generate /
+// generateRaw 自己会再 emit 一次 GENERATION_AFTER_COMMANDS('normal', {}, false)（JS-Slash-Runner src/function/generate/index.ts:322），
+// 而数据库「主 API」路（它的默认档）恰恰在外层 AFTER_COMMANDS 处理链里调 TavernHelper.generateRaw → 我们的一对监听器会被嵌套触发一次。
+// 没有计数时内层 last 提前吃掉 pending、外层 last 变空操作 → 数据库用含块的 $8 包出的 finalMessage 带着标记出站（2026-09-13 油猴形态 smoke 抓到）。
+// 规则：first 每次进来 depth+1，只在 depth===1 时附；last 每次进来 depth-1，只在回到 0 时剥。sweep / 新一趟 GENERATION_STARTED（无开着的三明治）复位。
+const dbBridgeRun = { pending: null, depth: 0 };
+const dbBridgeSnap = { published: null, revision: 0 };   // 快照口的发布态
+
+// 只在给规划器的副本里拆开数据库会吞的记号（它的占位符替换是字面 / 正则匹配，拆一枚零宽空格就不认；模型读到的字面不变）。
+function dbBridgeDefuse(text) {
+    let t = String(text == null ? '' : text);
+    if (!t) return t;
+    const Z = DB_BRIDGE_ZW;
+    t = t.replace(/\$(?=[0-9UC])/g, '$' + Z);        // $1 $5 $6 $7 $8 $9 $U $C（plot-task-engine performReplacements）
+    t = t.replace(/\{\{/g, '{' + Z + '{');            // {{tag}} → <tag></tag>（plot-tag-utils replacePlotTagPlaceholders）
+    t = t.replace(/\{\[/g, '{' + Z + '[');            // {[db…]} / {[sql…]}（template-vars）
+    t = t.replace(/<(?=if\b)/gi, '<' + Z);            // <if seed|cell|cond|db|sql="…">…</if> 条件块
+    t = t.replace(/sulv(?=[1-4])/g, 'sul' + Z + 'v'); // sulv1-4 = 四档速率字面替换
+    t = t.replace(/zhaohui/g, 'zhao' + Z + 'hui');    // zhaohui = 召回条数字面替换
+    return t;
+}
+
+// 附给规划器的块：开标记 / 抬头 / 消毒后的引导 / 闭标记。调用方自己加与原文之间的分隔（\n\n），剥回时一并摘掉。
+function dbBridgeBlock(directive) {
+    return DB_BRIDGE_MARK_OPEN + '\n' + DB_BRIDGE_PLANNER_HEAD + '\n' + dbBridgeDefuse(directive) + '\n' + DB_BRIDGE_MARK_CLOSE;
+}
+
+// 按标记剥回：摘掉每一对 开…闭（含紧挨着的 \n\n 分隔）；内文被数据库的模板通道改过也照剥（只认标记）。
+// 孤立开标记（闭标记被截）只摘开标记 + 抬头行，绝不删到文末——那会吞掉数据库自己的后文。
+function dbBridgeStrip(text) {
+    let t = String(text == null ? '' : text);
+    let removed = false, orphan = false;
+    for (let guard = 0; guard < 64; guard++) {
+        const open = t.indexOf(DB_BRIDGE_MARK_OPEN);
+        if (open < 0) break;
+        const close = t.indexOf(DB_BRIDGE_MARK_CLOSE, open + DB_BRIDGE_MARK_OPEN.length);
+        if (close >= 0) {
+            let start = open;
+            if (start >= 2 && t.slice(start - 2, start) === '\n\n') start -= 2;
+            else if (start >= 1 && t[start - 1] === '\n') start -= 1;
+            t = t.slice(0, start) + t.slice(close + DB_BRIDGE_MARK_CLOSE.length);
+        } else {
+            orphan = true;
+            let end = open + DB_BRIDGE_MARK_OPEN.length;
+            if (t[end] === '\n') end += 1;
+            if (t.startsWith(DB_BRIDGE_PLANNER_HEAD, end)) {
+                end += DB_BRIDGE_PLANNER_HEAD.length;
+                if (t[end] === '\n') end += 1;
+            }
+            t = t.slice(0, open) + t.slice(end);
+        }
+        removed = true;
+    }
+    return { text: t, removed, orphan };
+}
+
+function dbBridgeDbPresent() {
+    try { return typeof window !== 'undefined' && !!window.AutoCardUpdaterAPI; } catch (e) { return false; }
+}
+function dbBridgeChatId(ctx) {
+    try { if (ctx && typeof ctx.getCurrentChatId === 'function') return ctx.getCurrentChatId(); } catch (e) { /* fall through */ }
+    return (ctx && ctx.chatId != null) ? ctx.chatId : null;
+}
+// 槽里当前登记的引导（已 substituteParams 的那份）——与贴合注入读的是同一处，两边永远同源。
+function dbBridgeRegisteredDirective(ctx) {
+    const reg = ctx && ctx.extensionPrompts;
+    const v = reg && reg[ADVISOR_PROMPT_KEY] && reg[ADVISOR_PROMPT_KEY].value;
+    return String(v || '').trim();
+}
+function dbBridgeRerender(ctx, index, msg) {
+    try { if (ctx && typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(index, msg); } catch (e) { /* 显示层刷新失败不影响正文 */ }
+}
+// 兜底清扫用：输入框里若还留着标记（崩在两枚监听器之间 / 数据库手动中止把带块的「原文」回填），剥掉。
+function dbBridgeCleanTextarea() {
+    try {
+        const ta = dbBridgeTextarea();
+        if (ta && typeof ta.value === 'string' && ta.value.includes(DB_BRIDGE_MARK_OPEN)) ta.value = dbBridgeStrip(ta.value).text;
+    } catch (e) { /* ignore */ }
+}
+
+function dbBridgeTextarea() {
+    try { return (typeof document !== 'undefined') ? document.getElementById('send_textarea') : null; } catch (e) { return null; }
+}
+
+// makeFirst 监听器：闸全过才附。返回是否附了（单测读数）。
+// 附到哪：ST 普通发送在 GENERATION_AFTER_COMMANDS 时新文本【还在 #send_textarea】（script.js:4342 才读、4394 才 sendMessageAsUser），
+// 数据库的「策略2」就是读写输入框——所以输入框有正文就附到输入框；末条若是玩家消息（数据库「策略1」会先吃它：用户连发两句 /
+// 上一轮中止后留下的玩家楼）也附一份。两处都附、两处都剥：多附的那一份没人读，剥回即无痕。:8001 smoke 实测普通发送走输入框路。
+function dbBridgeAfterCommandsFirst(type, params, dryRun) {
+    // 嵌套计数先于一切闸：每一发 emit 都要配对（外层闸没过也一样），否则 last 的减法对不上。
+    dbBridgeRun.depth += 1;
+    if (dbBridgeRun.depth > 1) return false;                        // 嵌套那发（酒馆助手 generateRaw 再 emit）：不附、不碰 pending
+    try {
+        if (!ENABLE_DB_BRIDGE) return false;
+        if (dryRun) return false;
+        if (type != null && type !== 'normal') return false;        // ST 自己把 undefined 与 'normal' 同视（script.js sendTextareaMessage）
+        if (params && params.automatic_trigger) return false;
+        if (!getSettings().dbBridge) return false;
+        if (!dbBridgeDbPresent()) return false;
+        const ctx = getCtx();
+        const directive = dbBridgeRegisteredDirective(ctx);
+        if (!directive) return false;
+        const block = '\n\n' + dbBridgeBlock(directive);
+        const pend = { chatId: dbBridgeChatId(ctx), index: null, textarea: false };
+        const ta = dbBridgeTextarea();
+        if (ta && typeof ta.value === 'string' && ta.value.trim() && !ta.value.includes(DB_BRIDGE_MARK_OPEN)) {
+            ta.value = ta.value + block;
+            pend.textarea = true;
+        }
+        const chat = ctx.chat;
+        if (Array.isArray(chat) && chat.length) {
+            const index = chat.length - 1;
+            const msg = chat[index];
+            if (msg && msg.is_user && typeof msg.mes === 'string' && !msg.mes.includes(DB_BRIDGE_MARK_OPEN)) {
+                msg.mes = msg.mes + block;
+                pend.index = index;
+            }
+        }
+        if (!pend.textarea && pend.index == null) return false;
+        dbBridgeRun.pending = pend;
+        console.debug('[Story Oracle] 数据库联动：已把当前引导附给数据库的规划器（' + (pend.textarea ? '输入框' : '') + (pend.textarea && pend.index != null ? '+' : '') + (pend.index != null ? '玩家末条' : '') + '）');
+        return true;
+    } catch (e) {
+        console.warn('[Story Oracle] 数据库联动（附）跳过：', e);
+        return false;
+    }
+}
+
+// makeLast 监听器：只在三明治开着且回到最外层时剥；只摘我们的块，数据库的改写（输入框 / 末条）原样保留。
+function dbBridgeAfterCommandsLast() {
+    dbBridgeRun.depth = Math.max(0, dbBridgeRun.depth - 1);
+    if (dbBridgeRun.depth > 0) return false;                        // 内层那发：数据库还在规划中，pending 留给外层
+    const pend = dbBridgeRun.pending;
+    if (!pend) return false;
+    dbBridgeRun.pending = null;
+    try {
+        const ctx = getCtx();
+        let removed = false, orphan = false;
+        // 输入框：不论当初附没附（数据库策略1 会把带块的「原文」回填输入框），含标记就剥。
+        const ta = dbBridgeTextarea();
+        if (ta && typeof ta.value === 'string' && ta.value.includes(DB_BRIDGE_MARK_OPEN)) {
+            const r = dbBridgeStrip(ta.value);
+            if (r.removed) { ta.value = r.text; removed = true; orphan = orphan || r.orphan; }
+        }
+        const chat = ctx.chat;
+        if (pend.index != null && Array.isArray(chat) && chat[pend.index] && typeof chat[pend.index].mes === 'string') {
+            const msg = chat[pend.index];
+            const r = dbBridgeStrip(msg.mes);
+            if (r.removed) { msg.mes = r.text; removed = true; orphan = orphan || r.orphan; dbBridgeRerender(ctx, pend.index, msg); }
+        }
+        if (!removed) return false;
+        if (orphan) console.warn('[Story Oracle] 数据库联动：闭标记不见了（数据库的模板动了我们的块尾？），已只摘开标记');
+        console.debug('[Story Oracle] 数据库联动：已剥回，出站玩家消息与只装数据库相同');
+        return true;
+    } catch (e) {
+        console.warn('[Story Oracle] 数据库联动（剥）失败：', e);
+        return false;
+    }
+}
+
+// 兜底清扫：整份聊天按标记扫（含输入框）。有改动才 saveChat（ST 的 saveChat = saveChatConditional）。返回清掉的条数。
+async function dbBridgeSweep(reason) {
+    // 酒馆助手的 generate/generateRaw 在【规划中途】emit 宿主 GENERATION_STOPPED（dist 三处 emit(A.GENERATION_STOPPED, id)）——数据库主 API 路
+    // 正在我们的三明治里面调它。链条还开着（depth>0）时到来的 结束/中止 信号不是这一趟的：不能剥、不能清 pending（2026-09-13 油猴 smoke 抓到：
+    // 中途清扫剥走输入框、外层 last 空转、数据库用含块的 $8 包出的 finalMessage 带标记出站）。真正的结束/中止在链条收尾之后才来，那时 depth 已回 0。
+    if (dbBridgeRun.depth > 0 && (reason === 'generation_ended' || reason === 'generation_stopped')) return 0;
+    dbBridgeRun.pending = null;
+    dbBridgeRun.depth = 0;                                          // 链条中途崩掉留下的嵌套计数一并复位
+    try {
+        if (!ENABLE_DB_BRIDGE) return 0;
+        dbBridgeCleanTextarea();
+        const ctx = getCtx();
+        const chat = ctx.chat;
+        if (!Array.isArray(chat)) return 0;
+        let n = 0;
+        for (let i = 0; i < chat.length; i++) {
+            const m = chat[i];
+            if (!m || typeof m.mes !== 'string' || !m.mes.includes(DB_BRIDGE_MARK_OPEN)) continue;
+            const r = dbBridgeStrip(m.mes);
+            if (!r.removed) continue;
+            m.mes = r.text;
+            n++;
+            dbBridgeRerender(ctx, i, m);
+        }
+        if (n) {
+            console.warn('[Story Oracle] 数据库联动：清掉 ' + n + ' 条残留标记（' + reason + '）');
+            try { if (typeof ctx.saveChat === 'function') await ctx.saveChat(); } catch (e) { console.warn('[Story Oracle] 数据库联动：清扫后保存聊天失败：', e); }
+        }
+        return n;
+    } catch (e) {
+        console.warn('[Story Oracle] 数据库联动：清扫失败：', e);
+        return 0;
+    }
+}
+
+// 发布快照：只比内容（chatId / kind / directive / intensity），真变才 +1；null = 清掉（也算一次变化）。
+function dbBridgePublish(snapshot) {
+    const next = snapshot ? {
+        chatId: snapshot.chatId == null ? null : snapshot.chatId,
+        kind: String(snapshot.kind || ''),
+        directive: String(snapshot.directive || ''),
+        intensity: String(snapshot.intensity || 'normal'),
+    } : null;
+    const prev = dbBridgeSnap.published;
+    const same = (!prev && !next) || (!!prev && !!next && prev.chatId === next.chatId && prev.kind === next.kind
+        && prev.directive === next.directive && prev.intensity === next.intensity);
+    if (!same) dbBridgeSnap.revision += 1;
+    dbBridgeSnap.published = next;
+}
+// 只读快照口本体：每次返回新对象（调用方改不到我们的状态）。
+function dbBridgeGetActive() {
+    if (!ENABLE_DB_BRIDGE) return null;
+    const p = dbBridgeSnap.published;
+    if (!p) return null;
+    try {
+        if (!getSettings().dbBridge) return null;
+        if (dbBridgeChatId(getCtx()) !== p.chatId) return null;
+    } catch (e) { return null; }
+    return { schemaVersion: 1, chatId: p.chatId, revision: dbBridgeSnap.revision, kind: p.kind, directive: p.directive, intensity: p.intensity };
+}
+
+// 参谋条勾选框下面那行检测提示（文案待 Prince 否决权）。
+function dbBridgeRefreshHint() {
+    if (!ENABLE_DB_BRIDGE || !win) return;
+    const el = win.querySelector('#so-adv-dbbridge-hint');
+    if (!el) return;
+    if (!getSettings().dbBridge) { el.textContent = ''; return; }
+    el.textContent = dbBridgeDbPresent()
+        ? '已检测到 SP·数据库：每次发送前把当前引导附给它的「剧情推进」规划器看一眼，发给主模型前再剥掉。'
+        : '未检测到 SP·数据库——勾着也不会做任何事。';
 }
 
 /* ------------------------------------------------------------------ *
@@ -6656,6 +7294,22 @@ function glueRemoveBlock(content, text) {
     if (end < content.length && content[end] === '\n') end += 1;
     else if (start > 0 && content[start - 1] === '\n') start -= 1;
     return (content.slice(0, start) + content.slice(end)).replace(/^\n+|\n+$/g, '');
+}
+
+// 1.77.4 开口提示尾（spec §5 open-cue exception，Prince 2026-09-07「narrow trigger」）：有的预设把一条 user 角色的伪预填
+// 尾置在整个提示词最末（明月秋青 Myriad Stars 用户版 162 = `Qiuqingzi:<thinking><|no-trans|>`；上游是 assistant 真预填），
+// 它就是第 4 步选中的「玩家末条」。把协议贴在它尾巴上 = 提示尾被顶掉：模型不再把 <thinking> 当自己的开头，原生思考路上
+// 内联清单整段漏进正文（1.77.4 changelog 电池）。判据故意收窄成三种明确的预填形态——右修剪后
+// (a) 以 <|…|> 特殊记号收尾 · (b) 以开口标签 <name> 收尾 · (c) 末行是裸 ASCII 冒号说话人标签（≤32 非空白字符、整行只有它；
+// 全角冒号不算——中文正文太常见）。其余一切 = 非开口 = 贴尾照旧（差分测试钉 1.75 参考逐字节相同）。
+const GLUE_CUE_TOKEN_RE = /<\|[^|<>\r\n]{1,32}\|>$/;
+const GLUE_CUE_OPEN_TAG_RE = /<[A-Za-z_][\w-]{0,31}>$/;
+const GLUE_CUE_LABEL_RE = /(?:^|\n)[^\s:：]{1,32}:$/;
+function glueOpenCueTail(content) {
+    if (typeof content !== 'string') return false;
+    const t = content.replace(/\s+$/, '');
+    if (!t) return false;
+    return GLUE_CUE_TOKEN_RE.test(t) || GLUE_CUE_OPEN_TAG_RE.test(t) || GLUE_CUE_LABEL_RE.test(t);
 }
 
 function glueOutgoingPrompt(chat, slots, opts) {
@@ -6712,8 +7366,10 @@ function glueOutgoingPrompt(chat, slots, opts) {
             out[dirHost] = { ...u, content: u.content + GLUE_SEP + directive };
         }
     }
-    // 6) 贴协议——恒为玩家末条的尾巴
-    if (pulse) out[lastUser] = { ...out[lastUser], content: out[lastUser].content + GLUE_SEP + pulse };
+    // 6) 贴协议——恒为玩家末条的尾巴；1.77.4 开口提示尾例外（glueOpenCueTail）：贴【头】，让预设的提示尾仍是绝对末位。
+    //    引导（第 5 步）已经贴完再判：push 前置的引导不改尾巴，seed/normal 贴的是 dirHost（cue 条永远不是 dirHost）。
+    const cueTail = !!pulse && glueOpenCueTail(out[lastUser].content);
+    if (pulse) out[lastUser] = { ...out[lastUser], content: cueTail ? pulse + GLUE_SEP + out[lastUser].content : out[lastUser].content + GLUE_SEP + pulse };
     // 6b) 协议顶部副本（Batch D，Prince 2026-09-02 批；电池：底部单份 pro 在落地回合整行不写 0/4·1/4 → 顶+底 32/32）：
     //     追加到【领头 system run】的末条尾巴——ST semi/strict 会把连续领头 system 并成一条，落在 run 末条 = 并后块的
     //     尾巴（原生路）/ 末条领头 system 的尾巴（raw 路）。领头 run = 从 index 0 起连续的【无名】system——ST 把卡的示例
@@ -6752,7 +7408,8 @@ function glueOutgoingPrompt(chat, slots, opts) {
     if (pulse) {
         const c = countIn(pulse);
         if (c.n !== 2 || c.inUser !== 1 || c.inTop !== 1) return { chat: null, reason: 'selfcheck' };
-        if (!out[lastUser].content.endsWith(pulse) || !out[topIdx].content.endsWith(pulse)) return { chat: null, reason: 'selfcheck' };
+        const userOk = cueTail ? out[lastUser].content.startsWith(pulse + GLUE_SEP) : out[lastUser].content.endsWith(pulse);
+        if (!userOk || !out[topIdx].content.endsWith(pulse)) return { chat: null, reason: 'selfcheck' };
     }
     return { chat: out, reason: 'ok' };
 }
@@ -6760,7 +7417,13 @@ function glueOutgoingPrompt(chat, slots, opts) {
 // 生成类型由 GENERATION_STARTED 记下（prompt_ready 事件本身不带 type）。
 const glueGen = { type: null };
 // 生成结束 / 中止即清空：prompt_ready 若被 Generate 之外的调用方触发，不得继承上一次的类型。
-function glueGenReset() { glueGen.type = null; }
+// 1.78.0：酒馆助手的 generate/generateRaw 会在被调用处 emit 宿主 GENERATION_STOPPED（不是它自己的 js_generation_*）——数据库「主 API」路正在
+// GENERATION_AFTER_COMMANDS 链条里调它，于是这一发 STOPPED 落在【本趟叙述请求的 prompt_ready 之前】，把闩清成 null = 整轮不贴（油猴形态
+// smoke 实抓：叙述请求玩家末条头上没有引导）。链条开着（dbBridgeRun.depth>0）时到来的 结束/中止 不是这一趟的，闩不动；真正的结束在链条收尾后才来。
+function glueGenReset() {
+    if (ENABLE_DB_BRIDGE && dbBridgeRun.depth > 0) return;
+    glueGen.type = null;
+}
 // 最近一次判决（只在内存，不落盘）：支持排查「上一回合贴合跑了没」。
 const glueLast = { at: 0, applied: false, reason: 'never' };
 function glueNote(applied, reason) {
@@ -6784,6 +7447,10 @@ function glueArrayCarriesOurs(chat, slots) {
 function onPromptReadyGlue(data) {
     let eligible = false;
     try {
+        // 1.78.0：GENERATION_AFTER_COMMANDS 链条还开着时到来的 prompt_ready 是【链条里别人的生成】（数据库主 API 路经酒馆助手 generateRaw 发的规划请求，
+        // 它也 emit 这个事件）——不是本趟叙述请求。它的数组里躺着我们的引导原文（藏在 $8 的块里），不放过会被判 slot-missing 且 console.info 一行。
+        // 静默放过：不改数组、不写读数（glueLast 只记本趟叙述请求的判决）。
+        if (ENABLE_DB_BRIDGE && dbBridgeRun.depth > 0) return false;
         if (!ENABLE_INJECT_GLUE) return glueNote(false, 'flag-off');
         if (!data || !Array.isArray(data.chat)) return glueNote(false, 'no-chat');
         if (data.dryRun) return glueNote(false, 'dryrun');
@@ -7303,13 +7970,17 @@ function onChatChanged() {
     clearNoteOpts();      // 换聊天即作废本会话的记录按钮材料：撤销 / 换 swipe 针对的是旧聊天的 MVU / 楼层，跨聊天重挂会写错对象
     closeMvuEditor();     // 🎛 变量编辑器：卡里摆的是【旧聊天】的 stat_data 快照与脏表，跨聊天按「应用」就是往新聊天写旧路径 —— 直接关掉（没开时是空操作）
     cancelMvuedScan();    // 🎛 并掐掉在途的「分析取值规则」（它的结果已注定被丢弃：白烧钱，还会让新聊天的扫描键僵在「分析中…」最长 120 秒）。刻意不放进 closeMvuEditor —— ✕ / 点背景关卡不该中断本聊天的扫描
+    // 🧭 1.78.0 数据库联动：切聊天无条件按标记清一遍残留（上一轮崩在两枚监听器之间 / 勾选框已关但旧聊天里还留着）。不 await。
+    if (ENABLE_DB_BRIDGE) Promise.resolve(dbBridgeSweep('chat_changed')).catch(() => {});
     applyPlanInjection();
     if (win) renderPlanBar();
+    if (ENABLE_DB_BRIDGE) dbBridgeRefreshHint();
     checkPlanReminder();
     convoStreamKey = convoStreamKeyForMode(currentOracleMode(), getSettings());   // 新聊天：可见流复位到当前模式应在的房间（旧流已由自身写入落盘；这里不 sync，免把旧 convo 灌进新聊天元数据）
     loadConvoForChat();   // 用户功能请求：把本聊天保存的侧聊历史载入窗口（per-chat 持久化）
     refreshSummaryUI();   // 用户功能请求：刷新本聊天的运行概要编辑器
     loadDiagSelForChat(); // 用户功能请求：载入本聊天的诊断「精选世界书条目」选择
+    if (ENABLE_WI_CUSTOM_PICK) refreshWiCustomUI();   // 🌐 自定义范围清单随聊天重画（它自己读 metadata）
     loadFixCfgForChat();  // ✨ 校正模式 Phase 4：把校正控件重置成本聊天的生效配置（per-chat 持久化）
     if (win) refreshDraftCard();  // 角色工坊：把本聊天保存的草稿常驻卡载入 / 清空（per-chat 持久化，随切换刷新）
     // ✨/📋 1.77.0：回到这个聊天时，把切走那会儿暂存下来的校正 / 模板成品落地。放在【最后】——记录要落进
@@ -17785,10 +18456,6 @@ function buildWindow() {
                     <label class="so-field"><span>上下文深度（消息条数，-1 = 全部，0 = 不带）</span>
                         <input id="so-depth" type="number" step="1" min="-1">
                     </label>
-                    <label class="so-field"><span>剧情引导注入深度（参谋模式：方案指令插入主聊天的深度）</span>
-                        <input id="so-adv-depth" type="number" step="1" min="0">
-                    </label>
-                    ${ENABLE_SEQ_PULSE ? '<label class="so-row"><input id="so-seq-pulse" type="checkbox"> 落拍感应（自动提示当前拍可能已完成）</label>' : ''}
                     <label class="so-check"><input id="so-card" type="checkbox"><span>包含角色卡（描述 / 性格 / 场景）</span></label>
                     <label class="so-check"><input id="so-stat" type="checkbox"><span>附带变量状态（MVU stat_data，普通模式）—— 数值问题的权威来源；关掉则如实拒答数值</span></label>
                     <label class="so-check"><input id="so-world" type="checkbox"><span>附带「世界引擎」后台世界状态（普通 / 参谋模式）—— 目前仅适配世界引擎（World Engine，含本机改版）的当前版本；其它世界状态类扩展需日后单独适配。喂完整数据较吃 token，未识别到相关扩展时无开销</span></label>
@@ -17803,9 +18470,45 @@ function buildWindow() {
                             <option value="st">常驻 + 关键词匹配（ST 默认行为）</option>
                             <option value="char">仅角色相关世界书（排除全局）</option>
                             <option value="all">全部条目（规划用 —— 忽略关键词）</option>
+                            ${ENABLE_WI_CUSTOM_PICK ? '<option value="custom">自定义（手动挑书和条目）</option>' : ''}
                         </select>
                     </label>
                     <div class="so-hint" id="so-wi-hint"></div>
+                    ${ENABLE_WI_CUSTOM_PICK ? `
+                    <div id="so-wi-custom" hidden>
+                        <div class="so-lb-row">
+                            <i class="fa-solid fa-book so-lb-icon"></i>
+                            <details id="so-wic-bookpick" class="so-lb-bookpick">
+                                <summary id="so-wic-bookpick-sum" title="选择要发给神谕的世界书（可多选；不选＝当前激活的全部）">全部激活的世界书</summary>
+                                <div class="so-lb-bookpick-tools">
+                                    <button type="button" class="so-lb-mini" id="so-wic-book-all">全选</button>
+                                    <button type="button" class="so-lb-mini" id="so-wic-book-none">全不选（＝全部激活）</button>
+                                </div>
+                                <input type="text" id="so-wic-book-filter" class="so-lb-book-filter" placeholder="筛选世界书（名称）…">
+                                <div id="so-wic-book-list" class="so-lb-book-list"></div>
+                                <div id="so-wic-book-empty" class="so-lb-book-empty" hidden>（没有匹配的世界书）</div>
+                            </details>
+                            <div class="so-iconbtn" id="so-wic-refresh" title="刷新世界书列表"><i class="fa-solid fa-rotate-right"></i></div>
+                        </div>
+                        <label class="so-check so-lb-check"><input id="so-wic-hybrid" type="checkbox"><span>混合模式：勾选的条目 + 已选世界书里当前触发的绿灯条目</span></label>
+                        <div id="so-wic-entries" class="so-lb-entries">
+                            <div class="so-lb-entries-head">
+                                <span id="so-wic-entries-summary">条目：全部</span>
+                                <div class="so-iconbtn so-lb-ent-toggle" id="so-wic-entries-toggle" title="展开 / 折叠条目列表"><i class="fa-solid fa-chevron-down"></i></div>
+                            </div>
+                            <div class="so-lb-entries-tools">
+                                <button type="button" class="so-lb-mini" id="so-wic-all">全选</button>
+                                <button type="button" class="so-lb-mini" id="so-wic-none">全不选</button>
+                                <button type="button" class="so-lb-mini" id="so-wic-filtered" disabled title="只选中当前筛选 / 搜索结果里的条目（先在下方筛选框输入关键词）">全选筛选</button>
+                                <button type="button" class="so-lb-mini so-lb-mini-blue" id="so-wic-blue" title="只选常驻（蓝灯）条目，不含已禁用">仅蓝灯</button>
+                                <button type="button" class="so-lb-mini so-lb-mini-green" id="so-wic-green" title="只选关键词触发（绿灯）条目，不含已禁用">仅绿灯</button>
+                                <button type="button" class="so-lb-mini so-lb-mini-off" id="so-wic-disabled" title="只选已禁用条目">仅禁用</button>
+                            </div>
+                            <input type="text" id="so-wic-entries-filter" class="so-lb-entries-filter" placeholder="筛选条目（标题 / 关键词 / uid）…">
+                            <div id="so-wic-entries-list" class="so-lb-entries-list"></div>
+                        </div>
+                        <div class="so-hint" id="so-wic-hint"></div>
+                    </div>` : ''}
                     ${ENABLE_WI_EJS_RENDER ? '<label class="so-check"><input id="so-wi-ejs" type="checkbox"><span>支持读取 EJS 世界书条目；⚠ 含「写变量」的条目会被额外执行、可能影响卡内变量，遇异常请关闭。</span></label>' : ''}
                 </div>
             </details>
@@ -18123,6 +18826,11 @@ function buildWindow() {
                 <div class="so-mode-collapse-body">
             <label class="so-check so-adv-check"><input id="so-adv-preset" type="checkbox"><span>套用我的补全预设（参谋指令叠加其上）</span></label>
             <div class="so-hint so-adv-preset-warn">⚠ 仅在确实需要预设里的越狱时才勾选：预设的额外内容会分散模型注意力。未整理过预设时勾它不报错，会自动退回内置参谋提示词。</div>
+            <label class="so-field so-adv-field"><span>剧情引导注入深度（方案指令插入主聊天的深度）——模型不听引导时调低，最低 0</span>
+                <input id="so-adv-depth" type="number" step="1" min="0">
+            </label>
+            ${ENABLE_SEQ_PULSE ? '<label class="so-check so-adv-check"><input id="so-seq-pulse" type="checkbox"><span>落拍感应（自动提示当前拍可能已完成）</span></label>' : ''}
+            ${ENABLE_DB_BRIDGE ? '<label class="so-check so-adv-check"><input id="so-adv-dbbridge" type="checkbox"><span>数据库联动（实验）——装了 SP·数据库 且开着「剧情推进」时勾上，让它的规划也听当前引导</span></label><div class="so-hint" id="so-adv-dbbridge-hint"></div>' : ''}
             <button type="button" class="so-plan-mini" id="so-arc-new" title="实验性功能：把整条剧情弧线交给神谕做长程引导（仍在打磨）" style="display:none"><i class="fa-solid fa-route"></i> 新建弧线（手动·实验性）</button>
             <div id="so-arc-form" style="display:none">
                 <div class="so-hint so-arc-exp-warn">⚠ 弧线系统是实验性功能：长程引导（多拍 / 盲盒 / 自动起草骨架）仍在打磨，行为可能随版本调整。上面的单拍「开始引导」已稳定，不受影响。</div>
@@ -18537,6 +19245,26 @@ function bindControls() {
         const wisel = win.querySelector('#so-diag-wisel');
         if (wisel) wisel.style.display = 'none';
     }
+    // 🌐 世界书范围「自定义」绑定（1.81.0；旗关时 markup 不存在、整块不执行）。
+    if (ENABLE_WI_CUSTOM_PICK) {
+        win.querySelector('#so-wic-hybrid').addEventListener('change', (e) => {
+            const meta = getWiCustomMeta();
+            if (!meta) { e.target.checked = false; return; }
+            setWiCustomMeta({ books: meta.books, hybrid: e.target.checked, sel: meta.sel });
+        });
+        win.querySelector('#so-wic-refresh').addEventListener('click', () => populateWiCustomBooks(true));
+        win.querySelector('#so-wic-book-all').addEventListener('click', () => setAllWiCustomBooks(true));
+        win.querySelector('#so-wic-book-none').addEventListener('click', () => setAllWiCustomBooks(false));
+        win.querySelector('#so-wic-book-filter').addEventListener('input', (e) => filterWiCustomBooks(e.target.value));
+        win.querySelector('#so-wic-entries-toggle').addEventListener('click', () => win.querySelector('#so-wic-entries').classList.toggle('open'));
+        win.querySelector('#so-wic-all').addEventListener('click', () => setAllWiCustomEntries(true));
+        win.querySelector('#so-wic-none').addEventListener('click', () => setAllWiCustomEntries(false));
+        win.querySelector('#so-wic-filtered').addEventListener('click', () => selectFilteredWiCustomEntries());
+        win.querySelector('#so-wic-blue').addEventListener('click', () => setWiCustomEntriesByType('blue'));
+        win.querySelector('#so-wic-green').addEventListener('click', () => setWiCustomEntriesByType('green'));
+        win.querySelector('#so-wic-disabled').addEventListener('click', () => setWiCustomEntriesByType('off'));
+        win.querySelector('#so-wic-entries-filter').addEventListener('input', (e) => filterWiCustomEntries(e.target.value));
+    }
     // 标题栏「⋯」工具下拉：把 剧情概要 / 调试 / 设置 三个次级按钮收进一个下拉里。它们的 id 与各自
     // 的点击处理保持不变（只是被挪进菜单内），所以下面 openDebug / 设置开关 / openSummary 的绑定照旧生效。
     const toolsBtn = win.querySelector('#so-tools-btn');
@@ -18592,7 +19320,7 @@ function bindControls() {
         const panel = win.querySelector('#so-settings');
         const open = panel.classList.toggle('open');
         win.classList.toggle('so-settings-open', open);   // lets CSS free up space (hide mode toolbar)
-        if (open) { refreshProfiles(); populateSysPromptPresets(); }
+        if (open) { refreshProfiles(); populateSysPromptPresets(); if (ENABLE_WI_CUSTOM_PICK) refreshWiCustomUI(); }
     });
     // 用户功能请求：剧情概要编辑器（本聊天，自动保存到元数据）。
     win.querySelector('#so-summary-btn').addEventListener('click', openSummary);
@@ -18745,6 +19473,14 @@ function bindControls() {
             applyPlanInjection();
             syncSeqPulseHideRegex();
             renderPlanBar();
+        });
+    }
+    if (ENABLE_DB_BRIDGE) {
+        bind('#so-adv-dbbridge', 'dbBridge');
+        // 勾 / 取消：重登记一次让快照口即时反映（发布态本身不看勾选框，getActive 才看），并刷新检测提示。
+        win.querySelector('#so-adv-dbbridge').addEventListener('change', () => {
+            applyPlanInjection();
+            dbBridgeRefreshHint();
         });
     }
     bind('#so-card', 'includeCard');
@@ -19190,6 +19926,7 @@ function loadSettingsIntoForm() {
     win.querySelector('#so-depth').value = s.contextDepth;
     win.querySelector('#so-adv-depth').value = s.advisorDepth;
     if (ENABLE_SEQ_PULSE) win.querySelector('#so-seq-pulse').checked = s.seqPulse !== false;
+    if (ENABLE_DB_BRIDGE) { win.querySelector('#so-adv-dbbridge').checked = !!s.dbBridge; dbBridgeRefreshHint(); }
     win.querySelector('#so-card').checked = !!s.includeCard;
     win.querySelector('#so-stat').checked = !!s.chatIncludeStat;
     win.querySelector('#so-world').checked = !!s.chatIncludeWorld;
@@ -19224,7 +19961,7 @@ function loadSettingsIntoForm() {
     if (fixSelRowBox) fixSelRowBox.checked = getSettings().fixSelRowButton !== false;
     win.querySelector('#so-tools-header-toggle').checked = !!s.toolsInHeader;
     win.querySelector('#so-regex').checked = !!s.applyRegex;
-    win.querySelector('#so-wi').value = s.worldInfoMode;
+    win.querySelector('#so-wi').value = wiEffectiveMode(s);
     if (ENABLE_WI_EJS_RENDER) { const soWiEjs = win.querySelector('#so-wi-ejs'); if (soWiEjs) soWiEjs.checked = !!s.wiRenderEjs; }   // 世界书 EJS 渲染（回填勾选态）
     win.querySelector('#so-sendtemp').checked = !!s.sendTemperature;
     win.querySelector('#so-lb-story').checked = !!s.lorebookIncludeStory;
@@ -19460,9 +20197,21 @@ function updateWiHint() {
         hint.textContent = '无视关键词，发送所有已启用的世界书条目。适合做规划，但可能会消耗大量 token。';
     } else if (mode === 'char') {
         hint.textContent = '只扫描角色相关世界书（角色卡内嵌 + 角色绑定 + 本对话绑定），排除全局与人设世界书；蓝灯常驻 + 绿灯关键词匹配照常（含神谕侧聊最近问答）。';
+    } else if (mode === 'custom') {
+        hint.textContent = '神谕读世界书时只用你在下方勾选的条目——无视关键词与启用 / 禁用状态（开了混合模式会再加上已选书里当前触发的绿灯）。选择按【本聊天】记忆；一本书第一次进入范围时会按当前激活情况预选一份。变量规则条目（[mvu_update]）只喂诊断，这里不列出；token 估算不含混合模式追加与 EJS 展开。';
     } else {
         hint.textContent = '';
     }
+    if (ENABLE_WI_CUSTOM_PICK) reflectWiCustomVisible(mode === 'custom');
+}
+
+// 🌐 自定义范围整块只在下拉为「自定义」时显示；显示时填充清单（它自己读 metadata，不依赖 onChatChanged 的先后）。
+function reflectWiCustomVisible(on) {
+    if (!win || !ENABLE_WI_CUSTOM_PICK) return;
+    const box = win.querySelector('#so-wi-custom');
+    if (!box) return;
+    box.hidden = !on;
+    if (on) populateWiCustomBooks(false);
 }
 
 function updateBadge() {
@@ -23155,6 +23904,75 @@ async function computeDiagSnapshot() {
     return snap;
 }
 
+/* ---- 🌐 世界书范围「自定义」：快照 / 混合绿灯 / 播种（1.81.0）----
+ * 与诊断的 computeDiagSnapshot 是兄弟不是改造：这里【每本成功读到的书都落键】（空快照也 []），读失败进 failed；
+ * 非 ST 激活的书扫描扫不到其绿灯 → 快照只有蓝灯。规则条目（isMvuRuleEntry）永不进快照 / 清单。 */
+async function computeWiCustomSnapshot(names, extraScanText) {
+    const snap = Object.create(null);
+    const failed = [];
+    const list = Array.isArray(names) ? names : [];
+    const mod = await getWiEditApi();
+    if (!mod) return { snap, failed: [...list] };
+    let active = {};
+    try { active = await getActiveScanUids(extraScanText); } catch (e) { active = {}; }
+    for (const name of list) {
+        let data;
+        try { data = await mod.loadWorldInfo(name); } catch (e) { data = null; }
+        if (!data || !data.entries || typeof data.entries !== 'object') { failed.push(name); continue; }
+        const hit = (active[name] instanceof Set) ? active[name] : new Set();
+        const set = new Set();
+        for (const e of Object.values(data.entries)) {
+            if (!e || e.disable || isMvuRuleEntry(e)) continue;
+            if (e.constant === true || hit.has(Number(e.uid))) set.add(Number(e.uid));
+        }
+        snap[name] = set;   // 空集合也落键 —— 否则「首次出现即播种」会每次渲染重播
+    }
+    return { snap, failed };
+}
+
+// 混合模式的绿灯：只在 names（解析出的范围）里取此刻命中的绿灯（Prince 2026-09-13 ⑤）。调用方的额外扫描文本照 'char' 折入。
+async function wiCustomGreens(names, extraScanText) {
+    const out = Object.create(null);
+    const mod = await getWiEditApi();
+    if (!mod) return out;
+    const active = await getActiveScanUids(extraScanText);
+    for (const name of (Array.isArray(names) ? names : [])) {
+        const hit = active[name];
+        if (!(hit instanceof Set) || !hit.size) continue;
+        let data; try { data = await mod.loadWorldInfo(name); } catch (e) { continue; }
+        const g = new Set();
+        for (const e of Object.values((data && data.entries) || {})) {
+            if (e && e.constant !== true && !e.disable && hit.has(Number(e.uid))) g.add(Number(e.uid));
+        }
+        if (g.size) out[name] = g;
+    }
+    return out;
+}
+
+// 播种：对 names 里【无键】的书写一次快照（清单首次渲染 / 首次喂料，谁先到谁播）。已有键绝不覆盖；chatId 变了 → 不写、回 null。
+async function ensureWiCustomSeeded(names, chatId, extraScanText, stillCurrent) {
+    if (chatId !== wiCustomChatId()) return null;          // 调用方拿的 chatId 已不是当前聊天：不读不写
+    const meta = getWiCustomMeta();
+    if (!meta) return null;
+    const list = Array.isArray(names) ? names : [];
+    const missing = list.filter((n) => !Object.prototype.hasOwnProperty.call(meta.sel, n));
+    if (!missing.length) return meta;
+    const { snap } = await computeWiCustomSnapshot(missing, extraScanText);
+    if (chatId !== wiCustomChatId()) return null;          // 聊天已切走：这一趟的结果不属于当前聊天
+    if (typeof stillCurrent === 'function' && !stillCurrent()) return null;   // 已有更新一趟渲染：旧快照不落盘
+    const cur = getWiCustomMeta();
+    if (!cur) return null;
+    const sel = Object.assign(Object.create(null), cur.sel);   // 无原型：书名叫 constructor / __proto__ 也只是普通键
+    let changed = false;
+    for (const [book, set] of Object.entries(snap)) {
+        if (Object.prototype.hasOwnProperty.call(sel, book)) continue;   // 等待期间别处已写 → 不覆盖
+        sel[book] = [...set].sort((a, b) => a - b);
+        changed = true;
+    }
+    if (changed) setWiCustomMeta({ books: cur.books, hybrid: cur.hybrid, sel });
+    return getWiCustomMeta();
+}
+
 // 填充诊断选条目器的书下拉（与 populateLorebookBooks 同构，但目标存元数据而非设置）。
 async function populateDiagWiBooks(announce) {
     const sel = win.querySelector('#so-diag-book');
@@ -23421,6 +24239,337 @@ function onDiagHybridToggle(on) {
 function loadDiagSelForChat() {
     diagEntrySel = deserializeDiagSel(getDiagWiMeta().sel);
     refreshDiagPickerUI();
+}
+
+/* ---- 🌐 世界书范围「自定义」选书 / 选条目器（1.81.0，ENABLE_WI_CUSTOM_PICK）----
+ * 视觉复用 .so-lb-*；状态只有 metadata（无镜像）。每个含 await 的函数起手取 chatId + 递增序号，await 后核对：
+ * 不符 = 聊天已切走或有更新一趟 → 既不画 DOM 也不写 metadata。选书变化只改 meta.books；代码绝不改写它（已删的书只是解析不到）。 */
+let wiCustomRenderSeq = 0;
+
+function updateWiCustomHint(state) {
+    const hint = win && win.querySelector('#so-wic-hint');
+    if (!hint) return;
+    hint.textContent = state === 'nochat' ? '当前没有打开聊天，无法记忆选择'
+        : state === 'iofail' ? '世界书读取失败，选择未改动'
+        : '';
+}
+
+function updateWiCustomBookSummary(meta) {
+    const sum = win && win.querySelector('#so-wic-bookpick-sum');
+    if (!sum) return;
+    const n = meta && Array.isArray(meta.books) ? meta.books.length : 0;
+    sum.textContent = n ? `已选 ${n} 本世界书` : '全部激活的世界书';
+}
+
+function wiCustomHideEntries() {
+    const box = win && win.querySelector('#so-wic-entries');
+    if (box) box.classList.remove('shown');
+}
+
+// 填清单（含 ★ 激活标记、勾选态、混合勾选框回填），再填条目。枚举失败：保留上次清单、只亮提示、不改 meta。
+async function populateWiCustomBooks(announce) {
+    const listEl = win && win.querySelector('#so-wic-book-list');
+    if (!listEl) return;
+    const chatId = wiCustomChatId();
+    const seq = ++wiCustomRenderSeq;
+    listEl.dataset.chat = '';   // 重画期间旧行不许写（onWiCustomBookChange 核对此戳）
+    const meta = getWiCustomMeta();
+    if (!meta) { listEl.innerHTML = ''; updateWiCustomBookSummary(null); updateWiCustomHint('nochat'); wiCustomHideEntries(); return; }
+    const hyb = win.querySelector('#so-wic-hybrid');
+    if (hyb) hyb.checked = meta.hybrid;
+    let active = [];
+    let all = [];
+    let ok = true;
+    try {
+        if (!(await getWiEditApi())) ok = false;   // 模块缺席：getActiveBookNames / getAllBookNames 只会静默回空，不能当「没有书」
+        else [active, all] = await Promise.all([getActiveBookNames(), getAllBookNames()]);
+    } catch (e) { ok = false; }
+    if (seq !== wiCustomRenderSeq || chatId !== wiCustomChatId()) return;
+    if (!ok) { updateWiCustomHint('iofail'); return; }
+    const chosen = new Set(meta.books);
+    const activeSet = new Set(active);
+    listEl.innerHTML = '';
+    if (!all.length) {
+        listEl.innerHTML = '<div class="so-lb-ent-empty">（没有找到任何世界书。）</div>';
+    } else {
+        for (const name of all) {
+            const row = document.createElement('label');
+            row.className = 'so-lb-book-opt';
+            row.dataset.book = name;
+            row.innerHTML = `<input type="checkbox"${chosen.has(name) ? ' checked' : ''}><span class="so-lb-book-name"></span>`;
+            row.querySelector('.so-lb-book-name').textContent = (activeSet.has(name) ? '★ ' : '') + name;
+            row.querySelector('input').addEventListener('change', onWiCustomBookChange);
+            listEl.appendChild(row);
+        }
+    }
+    listEl.dataset.chat = String(chatId);
+    const bf = win.querySelector('#so-wic-book-filter');
+    if (bf && bf.value) filterWiCustomBooks(bf.value);
+    updateWiCustomBookSummary(meta);
+    updateWiCustomHint('ok');
+    await populateWiCustomEntries();   // 子渲染自己递增序号——这里只核聊天，不核序号
+    if (announce && chatId === wiCustomChatId()) addSystemNote('已刷新世界书列表。');
+}
+
+// 勾选变化 → 只改 meta.books（sel / hybrid 原样），再重画条目。
+function onWiCustomBookChange() {
+    const meta = getWiCustomMeta();
+    if (!meta) return;
+    const listEl = win.querySelector('#so-wic-book-list');
+    if (!listEl || listEl.dataset.chat !== String(wiCustomChatId())) return;   // 清单还是别的聊天的 / 正在重画：旧行不许写
+    const picked = [];
+    for (const box of win.querySelectorAll('#so-wic-book-list input[type="checkbox"]')) {
+        if (box.checked) {
+            const row = box.closest('.so-lb-book-opt');
+            if (row && row.dataset.book) picked.push(row.dataset.book);
+        }
+    }
+    setWiCustomMeta({ books: picked, hybrid: meta.hybrid, sel: meta.sel });
+    updateWiCustomBookSummary(getWiCustomMeta());
+    populateWiCustomEntries();
+}
+
+// 全选只勾【可见】行（筛选后别把整库勾进来）；全不选 = [] = 跟随激活。
+function setAllWiCustomBooks(on) {
+    for (const row of win.querySelectorAll('#so-wic-book-list .so-lb-book-opt')) {
+        const box = row.querySelector('input[type="checkbox"]');
+        if (!box) continue;
+        if (on) { if (row.style.display !== 'none') box.checked = true; }
+        else box.checked = false;
+    }
+    onWiCustomBookChange();
+}
+
+// 书名筛选：纯显隐，绝不改选择。
+function filterWiCustomBooks(q) {
+    const list = win.querySelector('#so-wic-book-list');
+    if (!list) return;
+    let anyRow = false;
+    let anyVisible = false;
+    for (const row of list.querySelectorAll('.so-lb-book-opt')) {
+        anyRow = true;
+        const show = bookNameMatchesQuery(row.dataset.book, q);
+        row.style.display = show ? '' : 'none';
+        if (show) anyVisible = true;
+    }
+    const empty = win.querySelector('#so-wic-book-empty');
+    if (empty) empty.hidden = !(anyRow && !anyVisible);
+}
+
+// 渲染条目清单：解析范围 → 播种无键的书 → 逐本读（读失败 = 该书行区显示「读取失败」、其键不动）→ 行带 data-book/uid/type/hay/tok。
+async function populateWiCustomEntries() {
+    const box = win && win.querySelector('#so-wic-entries');
+    const list = win && win.querySelector('#so-wic-entries-list');
+    if (!box || !list) return;
+    const chatId = wiCustomChatId();
+    const seq = ++wiCustomRenderSeq;
+    list.dataset.chat = '';   // 重画期间勾选不许写（persistWiCustomSel 核对此戳）
+    let meta = getWiCustomMeta();
+    if (!meta) { box.classList.remove('shown'); return; }
+    let names = [];
+    try {
+        const [allNames, activeNames] = await Promise.all([getAllBookNames(), getActiveBookNames()]);
+        names = resolveLbTargetNames(meta.books, allNames, activeNames);
+    } catch (e) { names = []; }
+    if (seq !== wiCustomRenderSeq || chatId !== wiCustomChatId()) return;
+    if (!names.length) { box.classList.remove('shown'); list.innerHTML = ''; refreshWiCustomSummary(); return; }
+    box.classList.add('shown');
+    list.innerHTML = '<div class="so-lb-ent-empty">读取条目中…</div>';
+    meta = (await ensureWiCustomSeeded(names, chatId, undefined, () => seq === wiCustomRenderSeq)) || meta;
+    if (seq !== wiCustomRenderSeq || chatId !== wiCustomChatId()) return;
+    const mod = await getWiEditApi();
+    const loaded = [];   // [{ name, entries | null }]（null = 读失败）
+    for (const name of names) {
+        let entries = null;
+        try {
+            const data = mod ? await mod.loadWorldInfo(name) : null;
+            if (data && data.entries) {
+                entries = Object.values(data.entries)
+                    .filter((e) => e && !isMvuRuleEntry(e))
+                    .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)));
+            }
+        } catch (e) { entries = null; }
+        loaded.push({ name, entries });
+    }
+    if (seq !== wiCustomRenderSeq || chatId !== wiCustomChatId()) return;
+    // 成功读到的书：把已不存在的 uid 从选择里剪掉——ST 新建条目会复用最小空闲 uid，不剪就会把没勾过的新条目发出去（astra F3）；
+    // 读失败的书不动；成功但空的书留显式 []。
+    {
+        const pruned = Object.assign(Object.create(null), meta.sel);
+        let changed = false;
+        for (const { name, entries } of loaded) {
+            if (entries === null || !Object.prototype.hasOwnProperty.call(pruned, name)) continue;
+            const valid = new Set(entries.map((e) => Number(e.uid)));
+            const cur = Array.isArray(pruned[name]) ? pruned[name] : [];
+            const next = cur.map(Number).filter((u) => valid.has(u));
+            if (next.length !== cur.length) { pruned[name] = next; changed = true; }
+        }
+        if (changed && seq === wiCustomRenderSeq && chatId === wiCustomChatId()) {
+            setWiCustomMeta({ books: meta.books, hybrid: meta.hybrid, sel: pruned });
+            meta = getWiCustomMeta() || meta;
+        }
+    }
+    const selMap = deserializeDiagSel(meta.sel);
+    const grouped = names.length > 1;
+    list.innerHTML = '';
+    list.dataset.chat = String(chatId);
+    for (const { name, entries } of loaded) {
+        if (grouped) {
+            const head = document.createElement('div');
+            head.className = 'so-lb-book-head';
+            head.dataset.book = name;
+            head.dataset.hay = name.toLowerCase();
+            head.innerHTML = '<i class="fa-solid fa-book"></i><span class="so-lb-book-name"></span>' +
+                `<span class="so-lb-book-count">${entries ? entries.length : '?'}</span>`;
+            head.querySelector('.so-lb-book-name').textContent = name;
+            list.appendChild(head);
+        }
+        if (entries === null || !entries.length) {
+            const sub = document.createElement('div');
+            sub.className = 'so-lb-ent-empty so-lb-ent-empty-sub';
+            sub.dataset.book = name;
+            sub.dataset.hay = name.toLowerCase();
+            sub.textContent = entries === null ? '（读取失败，选择未改动）' : '（此书暂无条目）';
+            list.appendChild(sub);
+            continue;
+        }
+        const set = selMap[name];
+        for (const e of entries) {
+            const checked = (set instanceof Set) && set.has(Number(e.uid));
+            const title = (e.comment && e.comment.trim()) ? e.comment.trim() : '（无标题）';
+            const keys = Array.isArray(e.key) ? e.key.filter(Boolean).join(', ') : '';
+            const type = e.disable ? 'off' : (e.constant ? 'blue' : 'green');
+            const row = document.createElement('label');
+            row.className = 'so-lb-ent';
+            row.dataset.book = name;
+            row.dataset.hay = `${grouped ? name + ' ' : ''}${e.uid} ${title} ${keys}`.toLowerCase();
+            row.dataset.type = type;
+            row.dataset.tok = String(wiCustomEntryCost(e));
+            row.innerHTML = `<input type="checkbox" data-uid="${e.uid}"${checked ? ' checked' : ''}>` +
+                `<span class="so-lb-ent-type so-lb-type-${type}"></span>` +
+                `<span class="so-lb-ent-uid">#${e.uid}</span><span class="so-lb-ent-title"></span>`;
+            row.querySelector('.so-lb-ent-title').textContent = title;
+            row.querySelector('input').addEventListener('change', toggleWiCustomEntry);
+            list.appendChild(row);
+        }
+    }
+    const f = win.querySelector('#so-wic-entries-filter');
+    if (f && f.value) filterWiCustomEntries(f.value);
+    refreshWiCustomSummary();
+    updateWiCustomFilteredBtn();
+}
+
+// 已渲染的行 → { 书名: Set<uid> }（只含【显示中】的书；未显示的书键在持久化时原样保留）。
+function wiCustomSelFromRows() {
+    const out = Object.create(null);
+    for (const row of win.querySelectorAll('#so-wic-entries-list .so-lb-ent')) {
+        const book = row.dataset.book || '';
+        const box = row.querySelector('input[type="checkbox"]');
+        if (!box) continue;
+        if (!out[book]) out[book] = new Set();
+        if (box.checked) out[book].add(Number(box.dataset.uid));
+    }
+    return out;
+}
+
+// 持久化 = 把显示中各书的勾选【合并】进 metadata（读失败 / 未显示的书键不动）；chatId 不符不写。
+function persistWiCustomSel(chatId) {
+    if (chatId !== wiCustomChatId()) return false;
+    const meta = getWiCustomMeta();
+    if (!meta) return false;
+    const sel = Object.assign(Object.create(null), meta.sel);
+    for (const [book, set] of Object.entries(wiCustomSelFromRows())) sel[book] = [...set].sort((a, b) => a - b);
+    return setWiCustomMeta({ books: meta.books, hybrid: meta.hybrid, sel });
+}
+
+// 摘要：已选 n / N · 约 X token（只按勾选行的正文成本求和；超 10 万标红）。
+function refreshWiCustomSummary() {
+    const summary = win && win.querySelector('#so-wic-entries-summary');
+    if (!summary) return;
+    const rows = [...win.querySelectorAll('#so-wic-entries-list .so-lb-ent')];
+    let selected = 0;
+    let tok = 0;
+    for (const row of rows) {
+        const box = row.querySelector('input[type="checkbox"]');
+        if (box && box.checked) { selected++; tok += Number(row.dataset.tok) || 0; }
+    }
+    const countEl = document.createElement('span');
+    countEl.textContent = `条目：已选 ${selected} / ${rows.length} · `;
+    const sizeEl = document.createElement('span');
+    sizeEl.className = 'so-lb-size' + (lbSizeIsHuge(tok) ? ' so-lb-size-huge' : '');
+    sizeEl.textContent = formatLbSizeEstimate(tok);
+    summary.textContent = '';
+    summary.appendChild(countEl);
+    summary.appendChild(sizeEl);
+}
+
+// 渲染时钉在清单上的聊天 id（改选路径用它做归属钉，不重新读——读到的可能已是别的聊天）。
+function wiCustomListChatId() {
+    const list = win && win.querySelector('#so-wic-entries-list');
+    return list && list.dataset.chat ? list.dataset.chat : null;
+}
+
+function toggleWiCustomEntry() {
+    refreshWiCustomSummary();
+    persistWiCustomSel(wiCustomListChatId());
+}
+
+function setAllWiCustomEntries(on) {
+    for (const row of win.querySelectorAll('#so-wic-entries-list .so-lb-ent')) {
+        const box = row.querySelector('input[type="checkbox"]');
+        if (box) box.checked = on;
+    }
+    toggleWiCustomEntry();
+}
+
+// 按灯型：'blue' / 'green' / 'off'——替换当前显示各书的选择（同诊断）。
+function setWiCustomEntriesByType(type) {
+    for (const row of win.querySelectorAll('#so-wic-entries-list .so-lb-ent')) {
+        const box = row.querySelector('input[type="checkbox"]');
+        if (box) box.checked = row.dataset.type === type;
+    }
+    toggleWiCustomEntry();
+}
+
+// 全选筛选：选择 = 当前筛选后仍可见的行（被筛掉的一律不选）。
+function selectFilteredWiCustomEntries() {
+    for (const row of win.querySelectorAll('#so-wic-entries-list .so-lb-ent')) {
+        const box = row.querySelector('input[type="checkbox"]');
+        if (box) box.checked = row.style.display !== 'none';
+    }
+    toggleWiCustomEntry();
+}
+
+function filterWiCustomEntries(q) {
+    const needle = (q || '').trim().toLowerCase();
+    const list = win.querySelector('#so-wic-entries-list');
+    if (!list) return;
+    for (const row of list.querySelectorAll('.so-lb-ent')) {
+        row.style.display = (!needle || (row.dataset.hay || '').includes(needle)) ? '' : 'none';
+    }
+    for (const head of list.querySelectorAll('.so-lb-book-head, .so-lb-ent-empty-sub')) {
+        if (!needle) { head.style.display = ''; continue; }
+        const book = head.dataset.book || '';
+        const headMatches = (head.dataset.hay || '').includes(needle);
+        const anyRowVisible = [...list.querySelectorAll('.so-lb-ent')]
+            .some((r) => (r.dataset.book || '') === book && r.style.display !== 'none');
+        head.style.display = (headMatches || anyRowVisible) ? '' : 'none';
+    }
+    updateWiCustomFilteredBtn();
+}
+
+function updateWiCustomFilteredBtn() {
+    const btn = win.querySelector('#so-wic-filtered');
+    if (!btn) return;
+    const f = win.querySelector('#so-wic-entries-filter');
+    btn.disabled = !(f && f.value && f.value.trim());
+}
+
+// 切聊天 / 开设置面板：下拉是「自定义」就按【当前聊天】重画（清单自己读 metadata）。
+function refreshWiCustomUI() {
+    if (!win || !ENABLE_WI_CUSTOM_PICK) return;
+    const sel = win.querySelector('#so-wi');
+    if (sel && sel.value === 'custom') populateWiCustomBooks(false);
 }
 
 /* ------------------------------------------------------------------ *
@@ -26881,6 +28030,246 @@ let fixSelState = null;    // { idx, swipeId, fingerprint, start, end, text, ful
 let fixSelCard = null;     // 懒建一次、复用
 let fixSelStored = null;   // 存下的选区 { start, end }（失焦后信它——浏览器失焦常报损坏范围）
 
+/* ------------------------------------------------------------------ *
+ * ✂️ 点选模式（ENABLE_FIX_TAP_SELECT）的模块级前提。权威状态【仍然只有】一个精确草稿 fixSelStored
+ * + 钉选表 fixSelState.pins —— 单元下标永远只是查表结果，不是状态（R1 的 index+delta 方案会在扩选
+ * 时悄悄丢掉已修剪的那一头，四人一致否掉）。模式在开卡时定一次，中途绝不因旋转 / 插鼠标而改。
+ * ------------------------------------------------------------------ */
+let fixSelMode = 'drag';          // 'tap' | 'drag'
+let fixSelExpandArmed = false;    // 扩选一次性武装：下一次被接受的点击取并集后立即解除
+let fixSelDebug = false;          // 裁定 0.3：localStorage['so.fixsel.debug'] 打开的逐手势日志
+let fixSelDebugLines = [];        // 环形缓冲（≤400 行），镜像进卡里那个只读文本框
+// 点击闸门的记录（按下那一刻的时间/坐标/滚动位 + 在按的指针集合）。住在模块级【只】为了让
+// fixSelApplyMode 能在每次开卡 / 切模式时把它归零（复审 #4）；布线仍全在 buildFixSelCard 里。
+let fixSelGate = { down: null, lastScrollAt: -1e9, active: new Set() };
+let fixSelSegOk = false;          // 微调可用性：开卡拿 fixSelGraphemes 探一次（Intl.Segmenter 缺席 → 置灰 + 说明，绝不手搓拆字）
+
+// 开卡时定一次模式：旗关恒拖选；否则存过的偏好赢，没存过看 (hover:none)+(pointer:coarse)。
+// localStorage / matchMedia 在隐私模式与老 WebView 上会缺席或抛 → 一律按「没存过 / 不是手机」处理。
+function fixSelResolveMode() {
+    if (!ENABLE_FIX_TAP_SELECT) return 'drag';   // 点选杀死开关读点①
+    let pref = null;
+    try { pref = localStorage.getItem('so.fixsel.mode'); } catch (e) { pref = null; }
+    const coarse = typeof window.matchMedia === 'function' && !!window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+    return fixSelPickMode(pref, coarse);
+}
+
+// 提示行文案的唯一出口（两种模式各一套说法）。拖选三句与 1.78.0 逐字节相同——那是回归钉，别动。
+function fixSelHint(kind, n) {
+    const tap = fixSelMode === 'tap';
+    if (kind === 'pinned') return tap ? `已钉住 ${n} 段——可继续点选下一段，或直接开始。` : `已钉住 ${n} 段——可继续划选下一段，或直接开始。`;
+    if (kind === 'none-open') return tap ? '未选中片段——请轻点上方一句。' : '未选中片段——请在上方文本里划选。';
+    return tap ? '未选中片段——请轻点上方一句。' : '未选中片段——请在上方文本里划选（至少 2 个字）。';
+}
+
+// 被拒文案的唯一出口（复审 #6：满 8 段那一句原先在 📌 与轻点各写了一遍，改文案必漏一处）。
+// reason 直接用 normalizePinAdd 自己的词汇（'overlap' / 'cap' / 'empty'），外加只有点选才可能发生
+// 的 'expand-cross'。'cap' 与模式无关；其余两种模式各一句。拖选那几句与 1.78.0 逐字节相同——回归钉。
+function fixSelRefuse(reason, n) {
+    const tap = fixSelMode === 'tap';
+    if (reason === 'cap') return `一次最多钉 ${MULTIFIX_MAX_PINS} 段。`;
+    if (reason === 'expand-cross') return `扩选会跨过片段${n}——请分开钉住。`;
+    if (reason === 'overlap') return tap ? `这句在片段${n} 里——先移除再重选。` : `与片段${n}重叠——换一段划选。`;
+    return tap ? '这句太短（至少 2 个字）。' : '这段去掉首尾空白后太短（至少 2 个字）。';
+}
+
+// 裁定 0.3 的逐手势日志（一行一条，环形 ≤400 行）。开关没开 = 不建 DOM、不攒缓冲、零开销。
+// 每条 apply 都印 activeElement（§5 opus：藏起来的 textarea 会不会又偷偷拿到焦点，只能这样看见）。
+function fixSelLog(kind, f) {
+    if (!fixSelDebug) return;
+    const o = f || {};
+    const v = (x) => (x === undefined || x === null ? '-' : x);
+    const sel = (fixSelStored && fixSelStored.end > fixSelStored.start) ? (fixSelStored.end - fixSelStored.start) : 0;
+    const act = (document.activeElement && document.activeElement.tagName) ? document.activeElement.tagName : '-';
+    const t = (performance.now() / 1000).toFixed(2).padStart(7);
+    fixSelDebugLines.push(`${t} ${kind} dt=${v(o.dt)} dx=${v(o.dx)} dy=${v(o.dy)} dTop=${v(o.dTop)} since=${v(o.since)} reason=${v(o.reason)} unit=${v(o.unit)} sel=${sel} mode=${fixSelMode} active=${act}`);
+    if (fixSelDebugLines.length > 400) fixSelDebugLines.shift();
+    const box = fixSelCard ? fixSelCard.querySelector('.so-fixsel-debuglog') : null;
+    if (box) box.value = fixSelDebugLines.join('\n');
+}
+
+// 开卡时读一次调试开关：开 → 在 #so-fixsel-body 末尾挂一个可全选复制的只读文本框（不碰剪贴板 API，
+// 手机上不需要授权）；关 → 连元素都不留（开过又关掉时把上一次那个撤走）。
+function fixSelDebugInit(card) {
+    let on = false;
+    try { on = !!localStorage.getItem('so.fixsel.debug'); } catch (e) { on = false; }
+    fixSelDebug = on;
+    fixSelDebugLines = [];
+    let box = card.querySelector('.so-fixsel-debug');
+    if (!on) { if (box) box.remove(); return; }
+    if (!box) {
+        box = document.createElement('details');
+        box.className = 'so-fixsel-debug';
+        box.innerHTML = '<summary>调试日志</summary><textarea class="so-fixsel-debuglog" readonly></textarea>';
+        card.querySelector('#so-fixsel-body').appendChild(box);
+    }
+    box.querySelector('.so-fixsel-debuglog').value = '';
+}
+
+// 贴底操作条的从属态：清除只在有草稿时可点；扩选按钮的字与 on 类跟着一次性武装走。
+// 凡是刷新提示行的地方都要顺手叫它一次（apply / 📌 / 移除 × / 开卡）。
+function fixSelSyncStrip(card) {
+    if (!ENABLE_FIX_TAP_SELECT || !card) return;
+    const clearBtn = card.querySelector('.so-fixsel-clear');
+    const expandBtn = card.querySelector('.so-fixsel-expand');
+    const adjustBtn = card.querySelector('.so-fixsel-adjust');
+    const has = !!(fixSelStored && fixSelStored.end > fixSelStored.start);
+    if (clearBtn) clearBtn.disabled = !has;
+    if (expandBtn) {
+        expandBtn.textContent = fixSelExpandArmed ? '取消扩选' : '扩选';
+        expandBtn.classList.toggle('on', fixSelExpandArmed);
+    }
+    // 微调要两个前提：手上有草稿，而且这个浏览器拆得了字素。拆不了就一直灰着并把原因写在 title 上
+    //（§2「No Intl.Segmenter」：宁可少一个功能，也绝不手搓拆字把 ZWJ 家庭 / 旗帜拆散）。
+    // 还有第三个前提（复审 #7）：钉满 8 段时 fixSelChProbe 的每一格都会被 normalizePinAdd 的 cap 挡掉 ——
+    // 开出来就是一窗全灰的格子、还没有一句解释。不如根本不让它开。
+    if (adjustBtn) {
+        const capped = ((fixSelState && fixSelState.pins) || []).length >= MULTIFIX_MAX_PINS;
+        adjustBtn.disabled = !has || !fixSelSegOk || capped;
+        adjustBtn.classList.toggle('so-fixsel-adjust-na', !fixSelSegOk);
+        if (fixSelSegOk) adjustBtn.removeAttribute('title');
+        else adjustBtn.title = '此浏览器不支持逐字微调';
+    }
+}
+
+// 把卡切进当前模式（开卡一次、头部切换一次）：类 / 按钮态 / 标题 / 切句表 / 信息行落位 / 重画。
+// 点选：textarea 落进一个 display:none 的祖先【并且】blur()——光靠 opacity/visibility/移出屏藏不死它
+//（§5 opus：那两个老监听会在每次轻点后 50ms 把草稿踩回去）；信息行连同那唯一一颗 📌【搬】进滚动器
+// 外面的贴底操作条（是搬不是克隆：一个元素、一处布线），软键盘弹起时正文照旧可见（裁定 0.2）。
+function fixSelApplyMode(card) {
+    if (!ENABLE_FIX_TAP_SELECT || !card) return;
+    const tap = fixSelMode === 'tap';
+    card.classList.toggle('so-fixsel-tap', tap);
+    card.querySelectorAll('.so-fixsel-mode-btn').forEach((b) => b.classList.toggle('on', b.dataset.mode === fixSelMode));
+    // 标题文字的唯一写点就是那个 span（旗开时 buildFixSelCard 一定建了它，复审 #2）——1b #e：原先那条
+    // 「找不到 span 就改文本节点」的兜底是死代码（旗关时本函数早已 return），删掉，不留第二个写法。
+    const titleTx = card.querySelector('#so-fixsel-head .so-fixsel-title-text');
+    if (titleTx) titleTx.textContent = tap ? ' ✂️ 选段校正 —— 轻点要改的句子' : ' ✂️ 选段校正 —— 划选要改的片段';
+    fixSelExpandArmed = false;
+    // 闸门记录按【每次开卡 / 每次切模式】归零（复审 #4）：万一有一次抬手被吃掉（页面被别的扩展挡下、
+    // 切后台），残留的 pointerId 会让此后每一次轻点都被判成「多指」——重开一次卡就该干净。
+    fixSelGate.down = null;
+    fixSelGate.active.clear();
+    // 1b #d：上一次滚动的时刻也一起归零。它的含义是「本次开卡里离上一次滚动多久」，上一张卡关掉前
+    // 那一下滚动与这一次无关；留着它，关卡后 120ms 内重开的第一次轻点会被 scroll-quiet 白白挡掉。
+    fixSelGate.lastScrollAt = -1e9;
+    // 微调选择器不跨模式、也不跨开卡：这里统一收起来（开卡走这条、头部切换也走这条）。真正的「落定 /
+    // 还原」在卡里那对 openChooser/closeChooser 手上，切换前已经先落定过了，这一下只是保证屏上不留残影。
+    const chBox = card.querySelector('.so-fixsel-chooser');
+    if (chBox) chBox.classList.remove('open');
+    // 开窗期间藏起钉选 chips / 整体要求的那个标记也一并撤掉。钉选框的【内联】display 不在这里还原：
+    // 走到这儿只有两条路——开卡（紧接着 renderFixSelPins 会重写它）与头部切换（切换处理器已经先
+    // closeChooser(true) 还原过了），两条路都不会留下一个藏着的钉选框。
+    card.classList.remove('so-fixsel-ch-open');
+    const body = card.querySelector('#so-fixsel-body');
+    const wrap = card.querySelector('.so-fixsel-wrap');
+    const strip = card.querySelector('.so-fixsel-tapstrip');
+    const inforow = card.querySelector('.so-fixsel-inforow');
+    // 清除按钮也是【搬】不是克隆（复审 #1）：拖选模式下贴底操作条整条不显示，撞上「与钉段重叠」或
+    // 「满 8 段」的草稿就既钉不进、又清不掉，而裁定 0.4 会一直拦着开始校正 —— 死胡同。搬到信息行里
+    // 紧挨 📌，两种模式同一个节点、同一处布线、同一处 disabled 刷新（fixSelSyncStrip）。
+    const clearBtn = card.querySelector('.so-fixsel-clear');
+    const tapbtns = card.querySelector('.so-fixsel-tapbtns');
+    const pinBtn = card.querySelector('.so-fixsel-pin-btn');
+    // 1.79 Prince 实报（长回复 + 点选）：点选层不封顶，于是钉选 chips 与「整体要求」框被顶到折叠线
+    // 以下——用户看不见自己钉了什么，更找不到写要求的框。它们跟信息行、清除一样【搬】进贴底条
+    //（同一个节点、布线一字不动：renderFixSelPins 与 go 都是 card.querySelector 现查）。
+    // 贴底条里的顺序恒为：信息行 → 钉选 chips → 整体要求 → 按钮排。
+    const pinsBox = card.querySelector('.so-fixsel-pins');
+    const instrBox = card.querySelector('.so-fixsel-instr');
+    if (tap) {
+        if (fixSelState) fixSelState.units = fixSelUnits(fixSelState.full);   // 查表用，开卡与切换时重算
+        const ta = card.querySelector('.so-fixsel-text');
+        try { ta.blur(); } catch (e) { /* ignore */ }
+        if (strip && inforow && inforow.parentElement !== strip) strip.insertBefore(inforow, strip.firstChild);
+        if (strip && tapbtns && pinsBox && instrBox) {   // 位置已经对了就不搬（搬动会让正在输入的框失焦）
+            if (pinsBox.parentElement !== strip || pinsBox.nextElementSibling !== instrBox) strip.insertBefore(pinsBox, tapbtns);
+            if (instrBox.parentElement !== strip || instrBox.nextElementSibling !== tapbtns) strip.insertBefore(instrBox, tapbtns);
+        }
+        if (clearBtn && tapbtns && clearBtn.parentElement !== tapbtns) tapbtns.appendChild(clearBtn);   // 回到 微调 之后
+    } else {
+        if (body && wrap && inforow && inforow.parentElement !== body) body.insertBefore(inforow, wrap.nextSibling);
+        if (body && inforow && pinsBox && instrBox) {   // 回到滚动体里的原顺序：正文 → 信息行 → chips → 要求
+            if (pinsBox.parentElement !== body || pinsBox.previousElementSibling !== inforow) body.insertBefore(pinsBox, inforow.nextSibling);
+            if (instrBox.parentElement !== body || instrBox.previousElementSibling !== pinsBox) body.insertBefore(instrBox, pinsBox.nextSibling);
+        }
+        if (clearBtn && inforow && pinBtn && clearBtn.parentElement !== inforow) inforow.insertBefore(clearBtn, pinBtn.nextSibling);
+    }
+    fixSelSyncStrip(card);
+    paintFixSelOverlayAll(card);
+    fixSelLog('MODE', { reason: fixSelMode });
+}
+
+// 点选层重画：整块 innerHTML 换 + scrollTop 保存/恢复（探针实测 30 次轻点 0 跳动）。所有重画点
+//（📌 / 移除 × / 预选 / 失焦）都经 paintFixSelOverlayAll 分流到这里，所以不需要第二套重画调用点。
+function renderFixSelPicker(card) {
+    const body = card.querySelector('#so-fixsel-body');
+    const picker = card.querySelector('.so-fixsel-picker');
+    if (!body || !picker) return;
+    const top = body.scrollTop;
+    picker.innerHTML = buildFixSelPickerHtml(
+        (fixSelState && fixSelState.full) || '',
+        (fixSelState && fixSelState.units) || [],
+        fixSelStored,
+        (fixSelState && fixSelState.pins) || []);
+    body.scrollTop = top;
+}
+
+// 点进已钉段时闪一下那段：chip 行与点选层里属于它的片同时加 so-fixsel-flash（CSS 两拍描边），
+// 动画结束自摘。jsdom 不发 animationend，类留着也无害。
+function fixSelFlashPin(card, idx) {
+    const pin = ((fixSelState && fixSelState.pins) || [])[idx];
+    if (!pin) return;
+    const targets = [];
+    const rows = card.querySelectorAll('.so-fixsel-pinrow');
+    if (rows[idx]) { const tag = rows[idx].querySelector('.so-fixsel-pintag'); if (tag) targets.push(tag); }
+    card.querySelectorAll('.so-fixsel-picker .so-fixsel-u-pin').forEach((sp) => {
+        if (Number(sp.dataset.s) >= pin.start && Number(sp.dataset.e) <= pin.end) targets.push(sp);
+    });
+    targets.forEach((elm) => {
+        elm.classList.remove('so-fixsel-flash');
+        void elm.offsetWidth;   // 强制回流：连点同一段时动画要能重放
+        elm.classList.add('so-fixsel-flash');
+        elm.addEventListener('animationend', () => elm.classList.remove('so-fixsel-flash'), { once: true });
+    });
+}
+
+// 保险带（§4 风险①）：万一原生选区还是在点选层里冒了出来（iOS 长按放大镜 / 别家扩展的选区弹窗），
+// 立刻清掉并记一行——点选层本就 user-select:none，出现即异常，值得在日志里留痕。
+function fixSelClearNativeSelection(card) {
+    try {
+        const picker = card.querySelector('.so-fixsel-picker');
+        const sel = document.getSelection ? document.getSelection() : null;
+        if (!picker || !sel || !sel.anchorNode || !picker.contains(sel.anchorNode)) return;
+        sel.removeAllRanges();
+        fixSelLog('SEL-CLEAR', { reason: 'native-selection-in-picker' });
+    } catch (e) { /* 没有选区 API 无害 */ }
+}
+
+// 纯函数（点选·微调）：一个字符位置落在哪个【散文】单元里。落在 gap 里或够不着时，取这个位置【之后】
+// 的第一个散文单元；再没有就退回 0（空表也回 0——调用方拿不到单元自然什么都画不出来）。可单测。
+function fixSelChUnitAt(units, pos) {
+    const us = Array.isArray(units) ? units : [];
+    const p = Number(pos) || 0;
+    let idx = us.findIndex((u) => u.kind === 'prose' && p >= u.start && p < u.end);
+    if (idx < 0) idx = us.findIndex((u) => u.kind === 'prose' && u.start >= p);
+    return Math.max(0, idx);
+}
+
+// 微调里【唯一】的「这条边能不能落在这儿」判定口。候选区间恒交给既有的 normalizePinAdd 裁决——微调自己
+// 不判收白边、不判至少 2 字、不判与钉段重叠、不判上限（§5 fable：多一处判定 = 多一套选择系统）。
+// 返回 ok（格子给不给点）+ exact（规整后与候选逐字节相同；‹ 一字 / 一字 › 只认这一种，被收边就算没落稳）
+// + added（规整后的区间，挑格子时直接采纳它）。edge='start' 时 pos 是新开头，'end' 时 pos 是新结尾。
+function fixSelChProbe(edge, pos) {
+    const d = fixSelStored;
+    if (!d || !fixSelState) return { ok: false, exact: false, cand: null, added: null, reason: 'no-draft' };
+    const cand = edge === 'start' ? { start: pos, end: d.end } : { start: d.start, end: pos };
+    const r = normalizePinAdd(fixSelState.pins, cand, fixSelState.full, MULTIFIX_MAX_PINS);
+    if (!r.ok) return { ok: false, exact: false, cand, added: null, reason: r.reason };
+    const added = { start: r.added.start, end: r.added.end };
+    return { ok: true, exact: added.start === cand.start && added.end === cand.end, cand, added, reason: '' };
+}
+
 function openFixSelectCard(presel) {
     if (!ENABLE_FIX_SELECT) return;                       // 杀死开关读点①
     // 生成中禁开卡（终审补钉）：并发单段跑会抢走共享 abortCtl（停止键错杀）＋提前清 isGenerating
@@ -26898,8 +28287,16 @@ function openFixSelectCard(presel) {
     ta.value = full;
     try { ta.setSelectionRange(0, 0); } catch (e) { /* ignore */ }   // 复开同文时 Chromium 不重置原生选区（值没变=赋值 no-op）——显式清掉，开卡必须真「未选中」
     fixSelCard.querySelector('.so-fixsel-instr').value = '';
+    if (ENABLE_FIX_TAP_SELECT) {   // 点选杀死开关读点③：开卡定一次模式，此后旋转 / 插鼠标都不再改
+        fixSelMode = fixSelResolveMode();
+        fixSelDebugInit(fixSelCard);
+        // 微调可用性：开卡拿一个字探一次，整个开卡周期就用这个答案（真拆字时 fixSelGraphemes 仍会
+        // 每次现查 Intl.Segmenter——这个布尔只决定按钮灰不灰，不是可用性的判据）。
+        fixSelSegOk = !!fixSelGraphemes('字', 0, 1);
+        fixSelApplyMode(fixSelCard);
+    }
     const info = fixSelCard.querySelector('.so-fixsel-info');
-    info.textContent = '未选中片段——请在上方文本里划选。';
+    info.textContent = fixSelHint('none-open');
     fixSelCard.querySelector('.so-fixsel-pin-btn').disabled = true;
     renderFixSelPins(fixSelCard);      // 开卡从零开始（v1 钉选不跨开卡持久，交接 4.1）
     updateFixSelGo(fixSelCard);        // 恢复「开始校正」+ disabled（0 钉无选区）
@@ -26910,13 +28307,21 @@ function openFixSelectCard(presel) {
         clearFixChatSel();
         const mapped = mapSelectionToRaw(presel.text, presel.prefix, presel.suffix, full);
         if (mapped) {
-            try {
-                ta.focus();
-                ta.setSelectionRange(mapped.start, mapped.end);
+            if (ENABLE_FIX_TAP_SELECT && fixSelMode === 'tap') {
+                // 点选：逐字采纳映射到的区间（【不】吸附到整句边界），并且绝不去聚焦那个已经藏起来的
+                // textarea、不派发 select —— 那两样都会把 record() 那条老路重新叫醒。
                 fixSelStored = { start: mapped.start, end: mapped.end };
-                ta.dispatchEvent(new Event('select'));   // 走卡自己的 record/apply 原路：已选中 N 字 + 📌 + go 态
+                fixSelCard.dispatchEvent(new Event('so-fixsel-refresh'));   // 卡内同一段写回（apply + 重画）
                 scrollFixSelToOffset(fixSelCard, mapped.start);
-            } catch (e) { /* 预选设置失败 = 按未选中开卡（fail-open） */ }
+            } else {
+                try {
+                    ta.focus();
+                    ta.setSelectionRange(mapped.start, mapped.end);
+                    fixSelStored = { start: mapped.start, end: mapped.end };
+                    ta.dispatchEvent(new Event('select'));   // 走卡自己的 record/apply 原路：已选中 N 字 + 📌 + go 态
+                    scrollFixSelToOffset(fixSelCard, mapped.start);
+                } catch (e) { /* 预选设置失败 = 按未选中开卡（fail-open） */ }
+            }
         } else {
             info.textContent = '未能在原文定位所选片段，请在卡内重新划选。';
         }
@@ -26949,6 +28354,68 @@ function buildFixSelCard() {
             </div>
         </div>`;
     win.appendChild(el);
+    if (ENABLE_FIX_TAP_SELECT) {   // 点选杀死开关读点②：旗关时以下三件一件不建 → 卡 HTML 与 1.78.0 逐字节相同
+        // ① 点选层：住在 #so-fixsel-body 里、排在 .so-fixsel-wrap 之前；它自己【不设】max-height/overflow，
+        //    所以点选模式下 #so-fixsel-body 是唯一的滚动器（共识 2）。
+        const picker = document.createElement('div');
+        picker.className = 'so-fixsel-picker';
+        picker.setAttribute('role', 'listbox');
+        picker.setAttribute('aria-label', '回复正文');
+        el.querySelector('#so-fixsel-body').insertBefore(picker, el.querySelector('.so-fixsel-wrap'));
+        // ② 头部两段切换（永远可见，挨着逃生 ✕）。
+        const modes = document.createElement('span');
+        modes.className = 'so-fixsel-modes';
+        modes.innerHTML = '<button type="button" class="so-fixsel-mode-btn" data-mode="tap" title="轻点句子选段（手机）">点选</button>'
+            + '<button type="button" class="so-fixsel-mode-btn" data-mode="drag" title="在文本里划选（桌面）">拖选</button>';
+        el.querySelector('#so-fixsel-head').insertBefore(modes, el.querySelector('.so-warn-x'));
+        el.classList.add('so-fixsel-modes-on');   // 有切换 = 标题要让位（防 CJK min-content 把它塌成一字一行）
+        // 标题那段文字包进一个 span：.so-warn-title 是 display:flex，text-overflow 对它无效（复审 #2），
+        // 要省略号就得落在一个真正的文字盒上。fixSelApplyMode 之后改的也是这个 span。
+        const titleEl = el.querySelector('#so-fixsel-head .so-warn-title');
+        if (titleEl && titleEl.lastChild && titleEl.lastChild.nodeType === 3) {
+            const titleTx = document.createElement('span');
+            titleTx.className = 'so-fixsel-title-text';
+            titleEl.insertBefore(titleTx, titleEl.lastChild);
+            titleTx.appendChild(titleTx.nextSibling);
+        }
+        // ③ 贴底操作条：在 #so-fixsel-body 【外面】（裁定 0.2——软键盘弹起时正文不被挤走）。
+        //    信息行与那颗 📌 由 fixSelApplyMode 搬进来，不在这里克隆。
+        const strip = document.createElement('div');
+        strip.className = 'so-fixsel-tapstrip';
+        strip.innerHTML = '<div class="so-fixsel-tapbtns">'
+            + '<button type="button" class="so-fixsel-expand">扩选</button>'
+            + '<button type="button" class="so-fixsel-adjust" disabled>微调</button>'
+            + '<button type="button" class="so-fixsel-clear" disabled>清除</button>'
+            + '</div>';
+        el.querySelector('#so-fixsel-card').insertBefore(strip, el.querySelector('#so-fixsel-btns'));
+        // ④ 微调选择器：停靠在 #so-fixsel-body 【下面】、贴底操作条【上面】——正文永远在屏上，绝不被
+        //    它替换（共识 1.9）。开合只切 open 类（不玩 hidden 属性），默认不显示。
+        const chooser = document.createElement('div');
+        chooser.className = 'so-fixsel-chooser';
+        chooser.innerHTML = '<div class="so-fixsel-ch-tabs">'
+            + '<button type="button" class="so-fixsel-ch-tab on" data-edge="start">开头：选第一个要改的字</button>'
+            + '<button type="button" class="so-fixsel-ch-tab" data-edge="end">结尾：选最后一个要改的字</button>'
+            + '</div>'
+            + '<div class="so-fixsel-ch-nav">'
+            + '<button type="button" class="so-fixsel-ch-prevunit">‹ 上一句</button>'
+            + `<button type="button" class="so-fixsel-ch-prev">‹ 前 ${FIXSEL_CH_PAGE} 字</button>`
+            + `<button type="button" class="so-fixsel-ch-next">后 ${FIXSEL_CH_PAGE} 字 ›</button>`
+            + '<button type="button" class="so-fixsel-ch-nextunit">下一句 ›</button>'
+            + '<span class="so-fixsel-ch-spacer"></span>'
+            + '<button type="button" class="so-fixsel-ch-nudge-l" title="边界前移一字">‹ 一字</button>'
+            + '<button type="button" class="so-fixsel-ch-nudge-r" title="边界后移一字">一字 ›</button>'
+            + '</div>'
+            + '<div class="so-fixsel-ch-cells"></div>'
+            + '<div class="so-fixsel-ch-preview"></div>'
+            + '<div class="so-fixsel-ch-foot">'
+            + '<button type="button" class="so-fixsel-ch-done">完成</button>'
+            + '<button type="button" class="so-fixsel-ch-cancel">取消微调</button>'
+            + '</div>';
+        el.querySelector('#so-fixsel-card').insertBefore(chooser, strip);
+    }
+    // 微调选择器的「先落定、再继续」钩子：卡上【不在】点选布线块里的那些动作（📌）要在改动草稿之前
+    // 先把微调窗收掉。旗关 / 没建选择器时恒为 null，调用点一律 if (chCommit) …。
+    let chCommit = null;
     const ta = el.querySelector('.so-fixsel-text');
     const overlay = el.querySelector('.so-fixsel-overlay');
     const info = el.querySelector('.so-fixsel-info');
@@ -26974,12 +28441,15 @@ function buildFixSelCard() {
             pinBtn.disabled = false;
         } else {
             fixSelState.start = 0; fixSelState.end = 0; fixSelState.text = '';
-            info.textContent = nPins ? `已钉住 ${nPins} 段——可继续划选下一段，或直接开始。` : '未选中片段——请在上方文本里划选（至少 2 个字）。';
+            info.textContent = nPins ? fixSelHint('pinned', nPins) : fixSelHint('none');
             pinBtn.disabled = true;
         }
         updateFixSelGo(el);
+        fixSelSyncStrip(el);         // 点选操作条的清除/扩选跟着走（旗关时 no-op）
+        fixSelLog('APPLY', {});      // 裁定 0.3：每次 apply 都印 activeElement
     };
     const record = () => {
+        if (fixSelMode === 'tap') return;   // 结构性闸门（§5 opus）：点选模式下这条老路【永不】写草稿
         const start = ta.selectionStart, end = ta.selectionEnd;
         if (typeof start === 'number' && typeof end === 'number' && end > start) fixSelStored = { start, end };   // 规则3：只在真选区时更新存档
         apply();
@@ -26989,7 +28459,10 @@ function buildFixSelCard() {
     // 规则2：touchend（iOS 长按选择手柄不触发 mouseup）
     ta.addEventListener('touchend', () => setTimeout(record, 50), { passive: true });
     // 规则1（续）：document selectionchange，仅当焦点在本 textarea——iOS 拖选手柄时唯一可靠信号
-    document.addEventListener('selectionchange', () => { if (document.activeElement === ta) record(); });
+    document.addEventListener('selectionchange', () => {
+        if (ENABLE_FIX_TAP_SELECT && fixSelMode === 'tap') { fixSelClearNativeSelection(el); return; }   // 点选：只清场，永不 record
+        if (document.activeElement === ta) record();
+    });
     // 规则5（多段版）：聚焦时只画钉选段——活选区让位给原生黄选；无钉 = 隐藏（与旧版行为一致）
     ta.addEventListener('focus', () => paintFixSelOverlayAll(el));
     // 规则4（多段版）：失焦时画 钉选段 + 存档选区（用户敲指令时都看得见）
@@ -26999,26 +28472,34 @@ function buildFixSelCard() {
     // 📌 钉住这段：规整（收白边 / 查重叠 / 查上限）→ 入列 → 清活选区（手机上顺序流：划一段钉一段）
     el.querySelector('.so-fixsel-pin-btn').addEventListener('click', () => {
         if (!fixSelState || fixSelState.text.length < 2) return;
+        if (chCommit) chCommit();   // 微调窗开着时按钉 = 先落定当下这个区间（不还原快照），再照常钉
         const r = normalizePinAdd(fixSelState.pins, { start: fixSelState.start, end: fixSelState.end }, fixSelState.full, MULTIFIX_MAX_PINS);
         if (!r.ok) {
-            info.textContent = r.reason === 'overlap' ? `与片段${r.index + 1}重叠——换一段划选。`
-                : (r.reason === 'cap' ? `一次最多钉 ${MULTIFIX_MAX_PINS} 段。` : '这段去掉首尾空白后太短（至少 2 个字）。');
+            info.textContent = fixSelRefuse(r.reason, r.index + 1);
             return;
         }
         fixSelState.pins = r.pins;
         fixSelState.start = 0; fixSelState.end = 0; fixSelState.text = '';
         fixSelStored = null;
         try { ta.setSelectionRange(0, 0); } catch (e) { /* ignore */ }
+        fixSelExpandArmed = false;   // 钉住 = 这一段结束，扩选的一次性武装随之作废
         renderFixSelPins(el);
         paintFixSelOverlayAll(el);
-        info.textContent = `已钉住 ${fixSelState.pins.length} 段——可继续划选下一段，或直接开始。`;
+        info.textContent = fixSelHint('pinned', fixSelState.pins.length);
         el.querySelector('.so-fixsel-pin-btn').disabled = true;
         updateFixSelGo(el);
+        fixSelSyncStrip(el);
     });
 
     go.addEventListener('click', () => {
         const instr = (el.querySelector('.so-fixsel-instr').value || '').trim();
         const pins = (fixSelState && fixSelState.pins) || [];
+        // 裁定 0.4（两种模式同守）：有钉在手时，还亮着的那段草稿必须先钉住或清除——看得见的暖色高亮
+        // 绝不能被悄悄丢掉。放在最前面，三条派发路都在它后面。
+        if (pins.length >= 1 && fixSelState && fixSelState.text.length >= 2) {
+            info.textContent = '还有一段选中但没钉住——请先钉住或清除。';
+            return;
+        }
         if (fixSelDispatchMode(pins.length) === 'batch') {   // 2+ 段 → 批发（每段一次冻结单段调用，并行）
             const chk = multiFixRunnable(pins, instr);
             if (!chk.ok) { info.textContent = `片段${chk.missing.join('、')}还没有要求——给这些段各写一条，或写一条整体要求。`; return; }
@@ -27039,12 +28520,260 @@ function buildFixSelCard() {
         close();
         runFixSelect(instr);   // C4（0 钉裸选区 = 今天的原路，逐字节不动）
     });
+
+    if (ENABLE_FIX_TAP_SELECT) {   // 点选布线（旗关时一个监听都不挂）：闸门 → 单元点击 → 操作条 → 头部切换
+        const bodyBox = el.querySelector('#so-fixsel-body');
+        const picker = el.querySelector('.so-fixsel-picker');
+        // 写回 = 共识 11 的那两行之后半段：apply() 出信息行 / 📌 / go 态，重画出高亮。预选支借
+        // so-fixsel-refresh 走同一段，所以卡里只有【一处】写回代码。
+        const writeBack = () => { apply(); paintFixSelOverlayAll(el); };
+        el.addEventListener('so-fixsel-refresh', writeBack);
+
+        // 一次被接受的轻点变成草稿的【唯一】出口，它自己什么都不裁决：能不能要（收白边 / ≥2 字 /
+        // 与钉段重叠 / 到没到上限）全由既有的 normalizePinAdd 说了算（§5 fable：诊断书里最怕的就是
+        // 这里冒出第二套判定）。它返回的 pins 数组在这儿丢掉——轻点只出草稿，不钉任何东西。
+        const onUnitTap = (i) => {
+            const unit = (fixSelState && fixSelState.units) ? fixSelState.units[i] : null;
+            if (!unit) return;
+            const cand = (fixSelExpandArmed && fixSelStored)
+                ? { start: Math.min(fixSelStored.start, unit.start), end: Math.max(fixSelStored.end, unit.end) }
+                : { start: unit.start, end: unit.end };
+            const r = normalizePinAdd(fixSelState.pins, cand, fixSelState.full, MULTIFIX_MAX_PINS);
+            if (!r.ok) {
+                info.textContent = fixSelRefuse((r.reason === 'overlap' && fixSelExpandArmed) ? 'expand-cross' : r.reason, r.index + 1);
+                if (r.reason === 'overlap') fixSelFlashPin(el, r.index);
+                fixSelExpandArmed = false;
+                fixSelSyncStrip(el);
+                fixSelLog('TAP-NO', { unit: i, reason: r.reason });
+                return;
+            }
+            closeChooser(true);   // 微调窗开着时新点一句 = 先落定当下的微调结果（不还原），再按新句重选
+            fixSelStored = { start: r.added.start, end: r.added.end };   // 已经规整过：📌 不会再挪动看得见的边
+            fixSelExpandArmed = false;
+            writeBack();
+        };
+
+        bodyBox.addEventListener('scroll', () => { fixSelGate.lastScrollAt = performance.now(); }, { passive: true });
+        picker.addEventListener('pointerdown', (e) => {
+            fixSelGate.active.add(e.pointerId);
+            const now = performance.now();
+            fixSelGate.down = { id: e.pointerId, t: now, x: e.clientX, y: e.clientY, scrollTop: bodyBox.scrollTop, type: e.pointerType, sinceScroll: now - fixSelGate.lastScrollAt, multi: fixSelGate.active.size > 1, cancelled: false };
+            fixSelLog('DOWN', { since: Math.min(99999, fixSelGate.down.sinceScroll) | 0 });
+        });
+        // 抬手 / 取消【恒挂在 document 上】：手指从点选层滑出去再松开时 picker 收不到 pointerup，
+        // 挂在 picker 身上的计数就只增不减 —— 第二次轻点起全被判成「多指」，点选模式当场作废。
+        // 探针没暴露这个洞（它每次都在同一块里抬手）。按 pointerId 记名，多余的抬手是无害的 delete。
+        document.addEventListener('pointerup', (e) => { fixSelGate.active.delete(e.pointerId); });
+        document.addEventListener('pointercancel', (e) => {
+            fixSelGate.active.delete(e.pointerId);
+            if (fixSelGate.down && fixSelGate.down.id === e.pointerId) fixSelGate.down.cancelled = true;
+        });
+        // 长按菜单 / 选区起手在点选层里一律不给（配 CSS 的 user-select:none 组）；touchmove 绝不 preventDefault、
+        // 指针绝不 setPointerCapture —— 那两样会把正常的滚动手势一起吃掉。
+        picker.addEventListener('contextmenu', (e) => { e.preventDefault(); });
+        picker.addEventListener('selectstart', (e) => { e.preventDefault(); });
+        picker.addEventListener('click', (e) => {
+            const d = fixSelGate.down;
+            const v = fixSelJudgeTap(d, performance.now(), { x: e.clientX, y: e.clientY }, bodyBox.scrollTop, fixSelGate.lastScrollAt);
+            const u = (e.target && e.target.closest) ? e.target.closest('.so-fixsel-u') : null;
+            const line = {
+                dt: v.dt, reason: v.reason || 'ok', unit: u ? u.dataset.i : '-',
+                dx: d ? Math.abs(e.clientX - d.x) : '-', dy: d ? Math.abs(e.clientY - d.y) : '-',
+                dTop: d ? (bodyBox.scrollTop - d.scrollTop) : '-', since: d ? (Math.min(99999, d.sinceScroll) | 0) : '-',
+            };
+            fixSelGate.down = null;
+            if (!v.ok) { fixSelLog('TAP-REJECT', line); return; }   // 被拒 = 屏上零变化
+            fixSelLog('TAP', line);
+            if (!u) return;                                        // 点在 gap（空白）上：什么都不做
+            onUnitTap(Number(u.dataset.i));
+        });
+
+        el.querySelector('.so-fixsel-expand').addEventListener('click', () => {
+            if (!fixSelStored || fixSelStored.end <= fixSelStored.start) { info.textContent = '先点一句，再按扩选。'; return; }
+            fixSelExpandArmed = !fixSelExpandArmed;
+            fixSelSyncStrip(el);
+            if (fixSelExpandArmed) info.textContent = '扩选：再点另一头，中间全选上。';
+            else apply();   // 收手 = 提示行回到「已选中 N 字」
+            fixSelLog('EXPAND', { reason: fixSelExpandArmed ? 'armed' : 'disarmed' });
+        });
+        el.querySelector('.so-fixsel-clear').addEventListener('click', () => {
+            closeChooser(true);   // 清除 = 连微调一起收掉，且【不】把快照放回来（草稿就是要没了）
+            fixSelStored = null;
+            fixSelExpandArmed = false;
+            // 拖选模式下 textarea 还聚焦着、原生选区还在，apply() 会走【实时】那一支把草稿原样捡回来
+            //（复审 #1 的出路必须真的通）——同 📌 成功后的那一行，显式清零。点选模式下是 no-op。
+            try { ta.setSelectionRange(0, 0); } catch (e) { /* ignore */ }
+            apply();
+            paintFixSelOverlayAll(el);
+        });
+
+        /* ------------------------------------------------------------------ *
+         * 微调选择器：停靠在正文【下面】的字素格边界挑选器（共识 1.9）。CH 是它的【全部】状态——
+         * 哪一头 / 哪一句 / 第几页 / 打开那一刻的快照。选区真相仍然只有 fixSelStored 一个；CH 里
+         * 没有第二份区间（snapshot 只为「取消」服务，落定后立刻扔掉）。
+         * ------------------------------------------------------------------ */
+        const chooser = el.querySelector('.so-fixsel-chooser');
+        const pinsBox = el.querySelector('.so-fixsel-pins');   // 开窗期间要把它藏起来（见 openChooser）
+        const CH = { edge: 'start', unit: 0, page: 0, snapshot: null, pinsDisplay: null };
+        const chIsOpen = () => chooser.classList.contains('open');
+        const chCells = chooser.querySelector('.so-fixsel-ch-cells');
+
+        // 挑一格 = 把那一头挪到这一格的边上。写草稿的路与轻点【同一条】：判定问 fixSelChProbe（= 唯一
+        // 那处 normalizePinAdd），采纳它规整后的区间，然后走 writeBack。
+        const chPick = (g) => {
+            const p = fixSelChProbe(CH.edge, CH.edge === 'start' ? g.start : g.end);
+            if (!p.ok) return;
+            fixSelStored = { start: p.added.start, end: p.added.end };
+            fixSelLog('CH-PICK', { reason: `${CH.edge} → [${fixSelStored.start},${fixSelStored.end})`, unit: CH.unit });
+            writeBack();
+            renderChooser();   // 挑完不关窗：格子上的 on 跟着挪，可以接着挑
+        };
+
+        // ‹ 一字 / 一字 ›：在边界前后各 FIXSEL_CH_NUDGE_WIN 字的窗口里拆字素，挪到相邻的那个字素边界。
+        // 只认【原样采纳】：规整后但凡被收过边（落在空白上）或被拒（踩进钉段 / 压塌区间），一律不动。
+        const chNudge = (dir) => {
+            if (!chIsOpen() || !fixSelStored || !fixSelState) return;
+            const full = fixSelState.full;
+            const pos = CH.edge === 'start' ? fixSelStored.start : fixSelStored.end;
+            const lo = Math.max(0, pos - FIXSEL_CH_NUDGE_WIN), hi = Math.min(full.length, pos + FIXSEL_CH_NUDGE_WIN);
+            const gs = fixSelGraphemes(full, lo, hi) || [];
+            const bounds = gs.map((g) => g.start).concat([hi]);
+            const at = bounds.findIndex((b) => b === pos);
+            if (at < 0) return;
+            const np = bounds[at + dir];
+            if (np === undefined) return;
+            const p = fixSelChProbe(CH.edge, np);
+            if (!p.ok || !p.exact) { fixSelLog('CH-NUDGE-NO', { reason: p.reason || 'trimmed' }); return; }
+            fixSelStored = { start: p.cand.start, end: p.cand.end };
+            fixSelLog('CH-NUDGE', { reason: `${CH.edge} ${dir > 0 ? '+' : '-'}1 → [${fixSelStored.start},${fixSelStored.end})` });
+            CH.unit = fixSelChUnitAt(fixSelState.units, CH.edge === 'start' ? fixSelStored.start : fixSelStored.end - 1);
+            writeBack();
+            renderChooser();
+        };
+
+        // 整块重画（页签 / 格子 / 翻页键从属态 / 预览）。没草稿的微调不成立 → 直接收工。
+        const renderChooser = () => {
+            if (!chIsOpen()) return;
+            const d = fixSelStored;
+            if (!d || d.end <= d.start || !fixSelState) { closeChooser(true); return; }
+            chooser.querySelectorAll('.so-fixsel-ch-tab').forEach((b) => b.classList.toggle('on', b.dataset.edge === CH.edge));
+            const us = fixSelState.units || [];
+            if (!us[CH.unit] || us[CH.unit].kind !== 'prose') {
+                CH.unit = fixSelChUnitAt(us, CH.edge === 'start' ? d.start : d.end - 1);
+            }
+            const u = us[CH.unit];
+            const gs = u ? (fixSelGraphemes(fixSelState.full, u.start, u.end) || []) : [];
+            const pages = Math.max(1, Math.ceil(gs.length / FIXSEL_CH_PAGE));
+            CH.page = Math.max(0, Math.min(CH.page, pages - 1));
+            chCells.innerHTML = '';
+            gs.slice(CH.page * FIXSEL_CH_PAGE, (CH.page + 1) * FIXSEL_CH_PAGE).forEach((g) => {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'so-fixsel-ch-cell';
+                b.dataset.s = String(g.start); b.dataset.e = String(g.end);
+                if (/^\s+$/.test(g.g)) {   // 空白字素得看得见，否则用户以为这一格是空的
+                    const w = document.createElement('span');
+                    w.className = 'so-fixsel-ch-ws';
+                    w.textContent = /\n/.test(g.g) ? '↵' : '␣';
+                    b.appendChild(w);
+                } else { b.textContent = g.g; }
+                // 纯装饰：这一格落在某个钉段里就标蓝。能不能点【不】看它，看下面那一问。
+                b.classList.toggle('inpin', ((fixSelState.pins) || []).some((p) => g.start < p.end && p.start < g.end));
+                b.disabled = !fixSelChProbe(CH.edge, CH.edge === 'start' ? g.start : g.end).ok;
+                b.classList.toggle('on', CH.edge === 'start' ? g.start === d.start : g.end === d.end);
+                b.addEventListener('click', () => chPick(g));
+                chCells.appendChild(b);
+            });
+            chooser.querySelector('.so-fixsel-ch-prev').disabled = CH.page === 0;
+            chooser.querySelector('.so-fixsel-ch-next').disabled = CH.page >= pages - 1;
+            chooser.querySelector('.so-fixsel-ch-preview').textContent = fixSelState.full.slice(d.start, d.end);
+        };
+
+        const openChooser = (edge) => {
+            // 三道前提都由按钮的从属态挡在外面（没草稿 / 拆不了字 = 灰）；这里只是不信任地再守一遍，
+            // 所以【不】写提示文案——屏上永远看不到它，只在调试日志里留痕。
+            if (!fixSelSegOk || chIsOpen()) return;
+            if (!fixSelStored || fixSelStored.end <= fixSelStored.start) { fixSelLog('CH-OPEN-NO', { reason: 'no-draft' }); return; }
+            CH.edge = edge === 'end' ? 'end' : 'start';
+            CH.snapshot = { start: fixSelStored.start, end: fixSelStored.end };
+            CH.unit = fixSelChUnitAt(fixSelState.units, CH.edge === 'start' ? fixSelStored.start : fixSelStored.end - 1);
+            CH.page = 0;
+            chooser.classList.add('open');
+            // 1.79 手机实测：贴底条在 540px 高的窗里已经吃掉约 227px，微调窗只剩约 51px（滚动条后面才是
+            // 格子）。微调与「写要求」从来不是同时用的两件事 —— 开窗期间把钉选 chips 与整体要求框藏起来，
+            // 信息行留着（它显示实时的「已选中 N 字」）。CSS 那条类规则管得住 .so-fixsel-instr；
+            // 钉选框管不住 —— renderFixSelPins 给它写的是【内联】display（flex/none），内联压过类规则
+            //（1.45.0 那条地雷的同族）。所以钉选框走「开窗时记下内联值、改 none，关窗时原样放回」。
+            // 记下的值不会过期：开窗期间 renderFixSelPins 一次也跑不到（📌 会先 chCommit() 收窗，
+            // 移除 × 那些行本身正被藏着，开卡那条路进来时窗必然是关的）。
+            CH.pinsDisplay = pinsBox ? pinsBox.style.display : null;
+            if (pinsBox) pinsBox.style.display = 'none';
+            el.classList.add('so-fixsel-ch-open');
+            fixSelLog('CH-OPEN', { reason: `edge=${CH.edge}`, unit: CH.unit });
+            renderChooser();
+        };
+        // commit=true：留住当下的区间（完成 / 📌 / 清除 / 新轻点 / 换模式都走这条）；
+        // commit=false：把草稿还原成打开那一刻的快照（只有「取消」走）。
+        const closeChooser = (commit) => {
+            if (!chIsOpen()) return;
+            if (!commit && CH.snapshot) fixSelStored = { start: CH.snapshot.start, end: CH.snapshot.end };
+            chooser.classList.remove('open');
+            el.classList.remove('so-fixsel-ch-open');
+            // 只还原【显示】，绝不碰值：用户在整体要求框里敲的字原样还在（那是 textarea 的 value，
+            // 从头到尾没人动过）。钉选框放回开窗前那个内联值。
+            if (pinsBox) pinsBox.style.display = CH.pinsDisplay === null || CH.pinsDisplay === undefined ? '' : CH.pinsDisplay;
+            CH.pinsDisplay = null;
+            CH.snapshot = null;
+            fixSelLog(commit ? 'CH-DONE' : 'CH-CANCEL', {});
+            writeBack();
+        };
+        chCommit = () => closeChooser(true);   // 给布线块【外面】那颗 📌 的钩子
+
+        el.querySelector('.so-fixsel-adjust').addEventListener('click', () => openChooser('start'));
+        chooser.querySelectorAll('.so-fixsel-ch-tab').forEach((tab) => {
+            tab.addEventListener('click', () => {   // 换一头 = 按【当前草稿的那一头】重新找句子，回到第 0 页
+                if (!fixSelStored) return;
+                CH.edge = tab.dataset.edge === 'end' ? 'end' : 'start';
+                CH.unit = fixSelChUnitAt(fixSelState.units, CH.edge === 'start' ? fixSelStored.start : fixSelStored.end - 1);
+                CH.page = 0;
+                renderChooser();
+            });
+        });
+        chooser.querySelector('.so-fixsel-ch-prev').addEventListener('click', () => { CH.page--; renderChooser(); });
+        chooser.querySelector('.so-fixsel-ch-next').addEventListener('click', () => { CH.page++; renderChooser(); });
+        const chMoveUnit = (dir) => {   // 只落在散文句上：换行 / 空白那些 gap 单元一律跳过
+            const us = (fixSelState && fixSelState.units) || [];
+            for (let k = CH.unit + dir; k >= 0 && k < us.length; k += dir) {
+                if (us[k].kind === 'prose') { CH.unit = k; CH.page = 0; renderChooser(); return; }
+            }
+        };
+        chooser.querySelector('.so-fixsel-ch-prevunit').addEventListener('click', () => chMoveUnit(-1));
+        chooser.querySelector('.so-fixsel-ch-nextunit').addEventListener('click', () => chMoveUnit(1));
+        chooser.querySelector('.so-fixsel-ch-nudge-l').addEventListener('click', () => chNudge(-1));
+        chooser.querySelector('.so-fixsel-ch-nudge-r').addEventListener('click', () => chNudge(1));
+        chooser.querySelector('.so-fixsel-ch-done').addEventListener('click', () => closeChooser(true));
+        chooser.querySelector('.so-fixsel-ch-cancel').addEventListener('click', () => closeChooser(false));
+
+        // 头部切换：只写 localStorage + 换模式（草稿 / 钉选 / 两处指令全原样留着；扩选武装作废）。
+        el.querySelectorAll('.so-fixsel-mode-btn').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const mode = btn.dataset.mode === 'tap' ? 'tap' : 'drag';
+                if (mode === fixSelMode) return;
+                closeChooser(true);   // 换模式 = 先落定微调（拖选那边没有停靠选择器）
+                try { localStorage.setItem('so.fixsel.mode', mode); } catch (e) { /* 隐私模式写不进，不挡本次切换 */ }
+                fixSelMode = mode;
+                fixSelApplyMode(el);
+                apply();   // 提示行换成新模式的说法
+            });
+        });
+    }
     return el;
 }
 
 // 多段 overlay 全量重画（规则4/5 的多段版）：钉选段（.so-fixsel-hl-pin，冷色）+ 失焦存档选区
 //（.so-fixsel-hl，暖色）。聚焦时只画钉——活选区让位原生黄选。无任何区间 = 隐藏（与旧版一致）。
 function paintFixSelOverlayAll(card) {
+    if (ENABLE_FIX_TAP_SELECT && fixSelMode === 'tap') { renderFixSelPicker(card); return; }   // 点选层是它自己的画布
     const ta = card.querySelector('.so-fixsel-text');
     const overlay = card.querySelector('.so-fixsel-overlay');
     const ranges = ((fixSelState && fixSelState.pins) || []).map((p) => ({ start: p.start, end: p.end, cls: 'so-fixsel-hl-pin' }));
@@ -27061,6 +28790,25 @@ function paintFixSelOverlayAll(card) {
 // 临时画一个只含标记 span 的 overlay、读它的 offsetTop、把 ta 滚到上 1/3 处，再交还 paintFixSelOverlayAll
 // 重画常规态（钉/存档高亮 + 滚动同步在那边）。量不出（jsdom / 零高布局）→ 停在顶部，无害。
 function scrollFixSelToOffset(card, start) {
+    if (ENABLE_FIX_TAP_SELECT && fixSelMode === 'tap') {   // 点选：找 data-s ≤ start < data-e 的那一片，滚到上 1/3
+        try {
+            const body = card.querySelector('#so-fixsel-body');
+            const picker = card.querySelector('.so-fixsel-picker');
+            let mark = null;
+            if (body && picker) {
+                picker.querySelectorAll('span[data-s]').forEach((sp) => {
+                    if (!mark && Number(sp.dataset.s) <= start && start < Number(sp.dataset.e)) mark = sp;
+                });
+                // 量位置只能用矩形差（复审 #3）：#so-fixsel-body 与点选层都没有定位，一个片的
+                // offsetParent 其实是 #so-fixsel（position:absolute），offsetTop 量的是另一个盒子。
+                if (mark) {
+                    const top = mark.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop;
+                    body.scrollTop = Math.max(0, top - Math.floor((body.clientHeight || 0) / 3));
+                }
+            }
+        } catch (e) { /* jsdom / 零高布局量不出 → 停在顶部，无害 */ }
+        return;
+    }
     try {
         const ta = card.querySelector('.so-fixsel-text');
         const overlay = card.querySelector('.so-fixsel-overlay');
@@ -27101,7 +28849,8 @@ function renderFixSelPins(card) {
             fixSelState.pins.splice(i, 1);
             renderFixSelPins(card); paintFixSelOverlayAll(card); updateFixSelGo(card);
             const info = card.querySelector('.so-fixsel-info');   // 终审补钉：移除后同步刷新提示行（防「已钉 n 段」滞留旧数）
-            if (info) info.textContent = fixSelState.pins.length ? `已钉住 ${fixSelState.pins.length} 段——可继续划选下一段，或直接开始。` : '未选中片段——请在上方文本里划选（至少 2 个字）。';
+            if (info) info.textContent = fixSelState.pins.length ? fixSelHint('pinned', fixSelState.pins.length) : fixSelHint('none');
+            fixSelSyncStrip(card);
         });
         row.appendChild(tag); row.appendChild(instr); row.appendChild(rm);
         box.appendChild(row);
