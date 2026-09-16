@@ -2048,7 +2048,7 @@ const ENABLE_CUSTOM_PERSONAS = true;
 // —— 更新提醒（1.38.0）——
 // SO_VERSION 是代码内唯一版本号，必须与 manifest.json 的 version 完全一致——update-check.test.mjs
 // 有失配即红的漂移钉（发版清单：两处一起 bump）。
-const SO_VERSION = '1.81.0';
+const SO_VERSION = '1.83.0';
 // 更新提醒总开关。false → 设置面板不渲染「更新」组、开窗不检查、红点绘制器与一键更新 no-op、
 // 绑定/回填跳过——字节级零行为变化。运行期另有 opt-out 设置 updAutoCheck（默认开）。
 const ENABLE_UPDATE_CHECK = true;
@@ -2308,6 +2308,11 @@ const defaults = {
     // 启动观察窗；见 busy 后锁存整批直到最终 idle UPDATE_ENDED（跨 retry false 间隙），最多 10 分钟。
     // 关闭时 awaitMvuCompatBatch 立即返回，不给普通 / 行内 MVU 用户增加任何延时。
     autoDiagnoseMvuCompat: false,
+    // 🧩 允许与其他脚本并写 MVU（1.83.0，opt-in，默认关；Prince 2026-09-15）。卡自带的回合后引擎（世界推进 / 核验脚本）
+    // 会在自动诊断「拍指纹 → 模型往返 → 写入」的窗口里合法改写 stat_data，整份指纹闸于是每回合都判陈旧。开时
+    // 状态指纹对不上不再整份作废：按路径逐条裁，落在没被别人动过的路径上的 op 照写（写在现态之上），冲突的丢弃并在
+    // 记录里点名（autoApplyFix 第 6 参 coWrite）。关着 = 1.64.0 整份指纹闸逐字节不变。
+    autoDiagnoseCoWrite: false,
     // 🔁 失败自动重试（Prince 点单 2026-08-28，默认关——每次重试都是一次真金白银的模型调用）：
     // 自动诊断这一轮没跑成时自动再试。Max = 次数上限（用户可输入，2 只是默认；经 diagRetryMax
     // 消毒后钳 [1,99]）；三枚分类勾选框独立组合（空白回复 / 格式错误 / 调用失败），全勾是「开主
@@ -2573,6 +2578,9 @@ let diagEntrySel = {};
 // Last prompt actually sent (for the debug viewer), captured in onSend.
 let lastPrompt = null;
 let lastPromptMeta = null;
+// Gemini 加固（2026-09-15，FIX 4）：本轮生成最后见到的 finish_reason（供空回复判据 isEmptyLengthReply）。
+// 每轮 generateReply 开头复位；由 callDirect / streamDirect / streamDirectArc 写。配置文件路读不到、恒空。
+let soLastFinishReason = '';
 
 jQuery(() => {
     try {
@@ -4071,6 +4079,60 @@ function sumLbSelectedTokens(rows, filter) {
     return sum;
 }
 
+/* ---- 🎭 角色工坊喂料口径（1.82.0）——纯函数层 -------------------------------
+ * 用户报障：工坊「突然开始读取被禁用的世界书条目导致 token 爆炸」。属实——buildBuilderContext
+ * 把目标书的每一条条目原样投喂（lbFormatEntry 对禁用条目照印，只多一行「- 类型：已禁用」），
+ * 唯一的收窄是选条目器的 per-book Set，而「从没在选条目器里动过手」= 缺键 / null = 整本发送。
+ * 1.82.0 起 **工坊这一路**（仅此一路）的 null 语义改成「该书当前【启用】的全部条目」：
+ *   · 缺键 / null = 跟随启用状态（新增条目自动进、ST 里禁掉的自动出）
+ *   · 显式 Set    = 恰好这些 uid，禁用也发（用户可能就是要喂一条禁用的「角色生成规则」——
+ *                   与诊断选条目器同一理据）
+ * 世界书模式（buildLorebookContext）与诊断精选的口径【一个字都不动】：那边有意投喂禁用条目。
+ * 不变式：勾选框显示的就是发出去的（WYSIWYG）——选择规则、渲染勾选态、折叠判据必须共用这层。 */
+
+// 一本书这一趟真正投喂哪些条目。sel = bldEntryFilter[书名]（Set = 显式选择 / null 缺席 = 全部启用的）。
+function bldPickFedEntries(entries, sel) {
+    const list = Array.isArray(entries) ? entries : [];
+    if (sel instanceof Set) return list.filter((e) => e && sel.has(e.uid));
+    return list.filter((e) => e && !e.disable);
+}
+
+// 显式 Set 能不能折回 null（＝「全部启用的」）。判据是【恰好等于启用集】：多一条禁用的不折
+// （那是用户特意加的），少一条启用的更不折（那是真筛选）。旧规则 `sel.size >= 全部行数` 只有在
+// 「全选」时才成立，于是把「含禁用的全集」当成了整本——正是本次 bug 的放大器。
+function bldSelCollapses(sel, enabledUids) {
+    if (!(sel instanceof Set)) return false;
+    const src = (enabledUids && typeof enabledUids[Symbol.iterator] === 'function') ? enabledUids : [];
+    const en = new Set(src);
+    if (sel.size !== en.size) return false;
+    for (const u of en) if (!sel.has(u)) return false;
+    return true;
+}
+
+// 工坊汇总行的体积求和。rows = [{book, uid, tok, enabled}]（DOM 层负责映射）。与 sumLbSelectedTokens
+// 同形，差别只在 null 分支：世界书模式整本全算，工坊只算启用的——读数必须与真发送量对得上。
+function sumBldSelectedTokens(rows, filter) {
+    if (!Array.isArray(rows)) return 0;
+    const f = filter || {};
+    let sum = 0;
+    for (const r of rows) {
+        if (!r) continue;
+        const sel = f[r.book || ''];
+        if (sel instanceof Set ? !sel.has(r.uid) : !r.enabled) continue;
+        sum += Number(r.tok) || 0;
+    }
+    return sum;
+}
+
+// 汇总行的计数段文案。selected 在 null 态下是【启用条数】、total 恒是渲染出的行数——
+// 两数不等时明说「全部启用的」，免得用户按行数估体积。
+function bldEntriesCountText(total, selected, anyFiltered) {
+    if (anyFiltered) return `条目：已选 ${selected} / ${total}`;
+    if (!total) return '条目：全部发送';
+    if (selected >= total) return `条目：全部（${total}）`;
+    return `条目：全部启用的（${selected} / ${total}）`;
+}
+
 // 🌐 自定义范围的纯收集器（1.81.0）：selMap = { 书名: Set<uid> }（显式模型：缺键 / 空集合 = 这本一条不发），
 // orderedBooks = [{ name, entries }] 有序数组（书序由调用方按 resolveLbTargetNames 定）。
 // 书内按 displayIndex ?? uid；剔空正文；剔 [mvu_update] 规则（它们只喂诊断——且必须在 renderWiEjs 之前按条目剔，
@@ -4192,8 +4254,9 @@ async function buildBuilderContext() {
         let entries = Object.values(data.entries)
             .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)));
         const total = entries.length;
-        const sel = bldEntryFilter[name];
-        if (sel instanceof Set) entries = entries.filter((e) => sel.has(e.uid));
+        // 1.82.0：唯一的选择规则（缺键 / null = 全部【启用】的；显式 Set = 恰好这些，禁用也发）。
+        // 抬头的「共 M 条」仍报全书条数——收窄了多少一眼可见。
+        entries = bldPickFedEntries(entries, bldEntryFilter[name]);
         if (!entries.length) continue;
         blocks.push(`=== 世界书：${name}（已选 ${entries.length} / 共 ${total} 条）===\n` + entries.map(lbFormatEntry).join('\n\n'));
     }
@@ -4209,7 +4272,7 @@ async function buildBuilderContext() {
 
 // 工坊 opt-in（bldScanWi）：关键词命中的补充世界书条目。跑 ST 真实扫描（蓝灯 + 主聊天 / 卡 / 工坊侧聊
 // 命中的绿灯——侧聊窗口同 sideChatScanBlob），剔除【选条目器已投喂】的条目（bldBookNames + bldEntryFilter
-// 语义：无 Set = 整本已喂）与 [mvu_update] 机制规则（诊断专属，镜像 MVU 的 UPDATE_REGEX），lbFormatEntry
+// 语义：无 Set = 全部启用的已喂；本函数本来就只收启用条目，故整块剔除仍然精确，1.82.0）与 [mvu_update] 机制规则（诊断专属，镜像 MVU 的 UPDATE_REGEX），lbFormatEntry
 // 原样格式与 bldContextText 一致。选条目器仍是唯一的「角色生成规则」权威——这块只是参考补充。
 async function buildBldScanWiText(s) {
     if (!s.bldScanWi) return '';
@@ -14032,7 +14095,13 @@ async function runAutoDiagnose(ctx, s, targetId, chatKey, compatSession, retrySt
     // ⚠ statKey 取的是 getMvuStatData() 的返回值，写侧（applyFix / autoApplyFix）取的是 diagStatOf(oldData)
     // —— 【同一个回退口径的同一份实现】（FIX 5）。以前写侧只认 oldData.stat_data，于是「没有 stat_data 的
     // 退化 MvuData」上两边恒不相等 → 每一次应用都被判陈旧。现在两侧同源，那种卡上也能正常写。
-    const captured = { chatKey: (chatKey != null ? chatKey : fixChatKey()), statKey: diagStatKey(stat) };
+    const captured = {
+        chatKey: (chatKey != null ? chatKey : fixChatKey()),
+        statKey: diagStatKey(stat),
+        // 🧩 1.83.0 并写：勾选时多留一份【诊断时】的 stat_data 副本，作 autoApplyFix 逐条裁剪的基线；关着时不留，
+        // 写侧收不到 coWrite = 1.64.0 整份指纹闸逐字节不变。
+        statSnap: (s.autoDiagnoseCoWrite && stat != null) ? JSON.parse(JSON.stringify(stat)) : null,
+    };
     // 钉住触发本轮的消息（maybePostReply 传入 targetId）：避免延时 + 调用窗口内队尾变化时诊断落到上一条；
     // 无 id（不应发生，防御性）→ 回退最近一条，保持旧行为。
     const { idx: aiIdx, text: latestReply } = (targetId != null)
@@ -14135,7 +14204,8 @@ async function runAutoDiagnose(ctx, s, targetId, chatKey, compatSession, retrySt
     // diagParseFailReason 只算一次，两个槽同源。
     const parseFail = patchBlock ? null : diagParseFailReason(finalText);
     const result = patchBlock
-        ? await autoApplyFix(Mvu, patchBlock, captured.statKey, captured.chatKey, finalText)
+        ? await autoApplyFix(Mvu, patchBlock, captured.statKey, captured.chatKey, finalText,
+            captured.statSnap != null ? { coWrite: { snap: captured.statSnap } } : undefined)
         : { status: 'unparsed', code: parseFail.code, detail: parseFail.detail, raw: finalText };
     // 确有改动 → 把结果反映到消息 / 状态栏（auto 诊断走 replaceMvuData，不发刷新事件，状态栏不会自己更新）：
     //   衍生（乙，原回复无块）：写回推导块 + saveChat + 重渲染（与官方 MVU 更新一致）；
@@ -14199,7 +14269,13 @@ async function runAutoDiagnose(ctx, s, targetId, chatKey, compatSession, retrySt
 // expectChatKey（可选，第 4 参）= 调用方钉的聊天身份锚点。parseMessage 是一次 await，等待期间照样能
 // 切聊天 —— 那时写进去的就是【A 聊天算出来的补丁落在 B 聊天的状态上】。
 // replyText（可选，第 5 参，1.68.0）= 模型这一轮回复的【原文】，供双区块闸看清「MVU 会执行几块」。
-async function autoApplyFix(Mvu, patchBlock, expectStatKey, expectChatKey, replyText) {
+// extra（可选，第 6 参，1.83.0）= { coWrite: { snap } }：🧩「允许与其他脚本并写 MVU」勾选时由调用方带来【诊断时】拍的
+// stat_data 副本。状态指纹对不上时不再整份作废，而是按 diagScopePatchToUntouched 逐条裁：落在没被别人动过的路径上
+// 的 op 照写（写在【现态】之上），与改动冲突的 op 丢弃并随结果带回（scoped = { kept, dropped }，记录里点名）；一条都不
+// 剩 / 裁不动（_.set 方言）→ 仍回 stale/stateMoved。缺席 = 1.82.0 行为逐字节不变。
+// 空补丁（模型核验通过、说无需改动）【不过】陈旧闸（Prince 2026-09-15）：本来就一字不写，判它陈旧只会把「无需改动」
+// 报成「已跳过」—— 卡自带回合后引擎的用户每一回合都看见一条假跳过。
+async function autoApplyFix(Mvu, patchBlock, expectStatKey, expectChatKey, replyText, extra) {
     if (!Mvu || typeof Mvu.parseMessage !== 'function') return { status: 'failed' };
     // 双区块闸（1.68.0）—— 与 applyFix 【同一条】，理由见那里。自动诊断才是每回合都跑的那个入口。
     const nBlocks = Math.max(diagCountPatchBlocks(patchBlock), diagCountPatchBlocks(replyText));
@@ -14208,15 +14284,30 @@ async function autoApplyFix(Mvu, patchBlock, expectStatKey, expectChatKey, reply
     const oldData = Mvu.getMvuData(opts);
     // 陈旧闸（审计簇 A/F）：补丁按【诊断当时】的状态算，现读对不上就不写。
     // 取数走 diagStatOf（同 applyFix，理由见该函数头注 FIX 5）。
-    if (expectStatKey != null && diagStatKey(diagStatOf(oldData)) !== expectStatKey) return { status: 'stale', reason: 'stateMoved' };
+    const moved = expectStatKey != null && diagStatKey(diagStatOf(oldData)) !== expectStatKey;
+    const parsedOps = diagPatchOpsOf(patchBlock);
+    const emptyPatch = !!(parsedOps && Array.isArray(parsedOps.ops) && parsedOps.ops.length === 0);
+    let patch = null, scoped;
+    if (moved && !emptyPatch) {
+        const snap = extra && extra.coWrite ? extra.coWrite.snap : undefined;
+        if (snap == null) return { status: 'stale', reason: 'stateMoved' };
+        // 🧩 并写：先过修复流水线（路径掰正了才裁得准），再按「谁动过哪条路径」逐条裁。
+        patch = repairDiagPatch(patchBlock, diagStatOf(oldData));
+        const sc = diagScopePatchToUntouched(patch.text, snap, diagStatOf(oldData));
+        if (!sc) return { status: 'stale', reason: 'stateMoved' };
+        scoped = { kept: sc.kept, dropped: sc.dropped };
+        if (!sc.kept) return { status: 'stale', reason: 'stateMoved', scoped };
+        patch = Object.assign({}, patch, { text: sc.text });
+    }
+    const done = (r) => (scoped ? Object.assign(r, { scoped }) : r);   // 裁过才带读数；没裁 = 返回形状逐字节同旧
     // 修复流水线 —— 与 applyFix 【同一条】（repairDiagPatch，1.67.0；含 1.66.1 的开错根掰正）。自动诊断
     // 是另一个写入口，且才是每回合都跑的那个；只接手动那条等于漏掉大头。
-    const patch = repairDiagPatch(patchBlock, diagStatOf(oldData));
+    if (!patch) patch = repairDiagPatch(patchBlock, diagStatOf(oldData));
     if (patch.fixed) console.warn('[Story Oracle] 自动诊断补丁自动修正：', patch);
     const swipePin = diagCaptureSwipe();          // M1 钉：解析【之前】取样
     const snapshot = JSON.parse(JSON.stringify(oldData));
     const newData = await Mvu.parseMessage(patch.text, oldData);
-    if (!newData) return { status: 'failed' };
+    if (!newData) return done({ status: 'failed' });
     // 诚实闸（审计簇 C）：基线用 snapshot（解析前深拷贝）、比对走 diagCmpKey（剔除派生数据），理由同 applyFix。
     const report = diagOpOutcomes(patch.text, (snapshot || {}).stat_data, newData.stat_data);
     if (diagCmpKey(newData) === diagCmpKey(snapshot)) {
@@ -14228,9 +14319,9 @@ async function autoApplyFix(Mvu, patchBlock, expectStatKey, expectChatKey, reply
         // 'nochange' —— 那两档的行为与 1.67.0 之前【逐字一致】（diag-applyfix 的 _.set 方言腿钉着）。
         if (!report) {
             const bare = diagZeroChangeReport(patch.text, diagStatOf(snapshot), null, patch, (snapshot || {}).schema);
-            return (bare.code === 'nodata' || bare.code === 'empty')
+            return done((bare.code === 'nodata' || bare.code === 'empty')
                 ? { status: 'nochange', repair: patch }
-                : { status: 'ineffective', zero: bare, repair: patch };
+                : { status: 'ineffective', zero: bare, repair: patch });
         }
         // 1.67.0：零变化语境的逐条诊断在这里【一次算好】随结果带走（本函数拿得到补丁与状态，侧聊记录
         // 那个纯函数拿不到）。zero.code === 'empty' 才是真·「模型说无需改动」——毒元素被剔光那档
@@ -14238,17 +14329,17 @@ async function autoApplyFix(Mvu, patchBlock, expectStatKey, expectChatKey, reply
         // 基线同 diagOpOutcomes：snapshot（解析前深拷贝），理由见 applyFix 同处注释。
         // schema 第 5 参同 applyFix（1.77.3）。
         const zero = diagZeroChangeReport(patch.text, diagStatOf(snapshot), report, patch, (snapshot || {}).schema);
-        return (report.total === 0 && zero.code === 'empty')
+        return done((report.total === 0 && zero.code === 'empty')
             ? { status: 'verified', report, repair: patch }
-            : { status: 'ineffective', report, zero, repair: patch };
+            : { status: 'ineffective', report, zero, repair: patch });
     }
     // swipe 钉（审计簇 M1）：绝不把 A swipe 算的状态写进 B。
-    if (diagPinMoved(swipePin, diagCaptureSwipe())) return { status: 'stale' };
+    if (diagPinMoved(swipePin, diagCaptureSwipe())) return done({ status: 'stale' });
     // 聊天在 parseMessage 等待期间被切换 → 绝不把 A 聊天的补丁写进 B；'applied' 不产生 →
     // 撤销记录也不会挂错房。
-    if (expectChatKey != null && fixChatKey() !== expectChatKey) return { status: 'stale', reason: 'chatSwitched' };
+    if (expectChatKey != null && fixChatKey() !== expectChatKey) return done({ status: 'stale', reason: 'chatSwitched' });
     await Mvu.replaceMvuData(newData, opts);
-    return { status: 'applied', snapshot, applied: JSON.parse(JSON.stringify(newData)), report, repair: patch };
+    return done({ status: 'applied', snapshot, applied: JSON.parse(JSON.stringify(newData)), report, repair: patch });
 }
 
 // 重渲染该 AI 消息，让前端状态栏反映这次自动诊断的写入。auto 诊断经 Mvu.replaceMvuData 写库，而它【不发】
@@ -16410,6 +16501,38 @@ function diagStatKey(stat) {
     catch (e) { return 'null'; }
 }
 
+// 纯函数（1.83.0 🧩 允许与其他脚本并写 MVU）：把补丁裁到「没被别人动过」的那部分。snapStat = 诊断时拍的
+// stat_data、liveStat = 写入前现读的那份；一条 op 的落点路径（path；move 类还看 from）在两份之间【值不同】
+// = 别人在诊断期间动过它 → 丢弃并点名，其余照留。判据是逐路径取值比对、口径沿用 normalizeForVerify（VWD 折
+// 第一格、剥 $internal），与 diagOpOutcomes 同源：整个父容器被换掉时子路径的值自然也不同，天然算冲突；新建键
+// 两边都查不到 = 没人动过。只认 <JSONPatch> / <json_patch> 里的 JSON 数组（_.set 方言回 null，调用方退回整份
+// 跳过）。ops 数组之外的字节一个不动（外壳原样，写回手法同 repairDiagPatch）。可单测。
+function diagScopePatchToUntouched(patchText, snapStat, liveStat) {
+    const text = String(patchText == null ? '' : patchText);
+    const got = diagPatchOpsOf(text);
+    if (!got || !Array.isArray(got.ops)) return null;
+    const fp = (stat, path) => {
+        const r = diagResolvePath(stat, path, true);
+        return (r && r.ok) ? JSON.stringify(normalizeForVerify(r.value)) : null;
+    };
+    const touched = (p) => typeof p === 'string' && p !== '' && fp(snapStat, p) !== fp(liveStat, p);
+    const kept = [], dropped = [];
+    for (const op of got.ops) {
+        const dest = (op && typeof op.path === 'string') ? op.path : ((op && typeof op.to === 'string') ? op.to : '');
+        const from = (op && typeof op.from === 'string') ? op.from : '';
+        if (touched(dest) || touched(from)) dropped.push({ op: op && op.op, path: dest });
+        else kept.push(op);
+    }
+    if (!dropped.length) return { text, kept: kept.length, dropped };
+    const at = text.indexOf(got.inner, got.m.index);
+    if (at < 0) return null;
+    return {
+        text: text.slice(0, at) + '\n' + JSON.stringify(kept, null, 2) + '\n' + text.slice(at + got.inner.length),
+        kept: kept.length,
+        dropped,
+    };
+}
+
 // 纯函数：这段文本里有没有【裸】可执行 MVU 指令（不带已识别包装）——bare <json_patch> 或行首 _.set(。
 // 只喂给 甲/乙 推导闸（detectMvuBlockDialect 之外的补充探针），绝不接到 extract/strip 等其它消费者上：
 // MVU 按文本位置执行这两种形态（方言表注释），探不到就误入【乙·推导】= 已生效的回合被再算一遍。可单测。
@@ -17524,9 +17647,11 @@ function diagFullReplyOpts(status, raw) {
 // 那一版同样【不会】说「可能已生效」）。repair = 修复流水线的计数读数。两槽都缺席时正文
 // 与加这两个槽之前【逐字节】相同（老记录零漂移，diag-note-content.test.mjs 有字节钉）。
 //   doubleblock  回复里有两个（或更多）MVU 更新区块 → 一个字都没写，请重掷（1.68.0，Prince 定调）
-function autoDiagNoteContent({ status, patch, stamp, detail, raw, report, notice, zero, repair, blocks }) {
+//   scoped（1.83.0，可选槽）= 🧩 并写模式裁过的读数 { kept, dropped }：dropped 非空才在末尾追加一行点名；缺席 /
+//                空数组时正文逐字节同旧（老记录零漂移）。
+function autoDiagNoteContent({ status, patch, stamp, detail, raw, report, notice, zero, repair, blocks, scoped }) {
     const t = stamp ? ' · ' + stamp : '';
-    const fixNote = repairDiagNote(repair);
+    const fixNote = repairDiagNote(repair) + diagCoWriteDroppedLine(scoped);
     if (status === 'applied') {
         const body = (patch && patch.trim()) ? `\n${patch.trim()}` : '';
         // notice（Task 7）= 写入落在用户自己那一楼时的落点提示，由调用方【在写入那一刻】算好传进来
@@ -17575,14 +17700,28 @@ function autoDiagNoteContent({ status, patch, stamp, detail, raw, report, notice
         // ⚠ 'chatSwitched' 有意留在表里：本函数是【纯的】、按 status+reason 说人话，这是它的契约；
         // 至于那一轮该不该真的落一条记录，是【调用方】的作用域判断（runAutoDiagnose 走 noNote 掐掉），
         // 别因为「现在没人渲染它」把这一行删了 —— 将来若改成往【捕获到的那个聊天】补写记录，就要它。
+        // 1.83.0（Prince 候选 B）：状态被改那一档说清是【MVU 变量】被改、可能是别的脚本 / 扩展所为 ——
+        // 三张真卡（世界推进 / MVU核验 / JL12M）都是回合后引擎在写，旧句「另一次写入 / 新回复」谁也看不懂。
+        // 并写模式下全部冲突时，diagCoWriteDroppedLine 点名撞上的路径（缺席 = 一字不加）。
+        if (detail === 'stateMoved') {
+            return `⏭️ 自动诊断${t} —— 已跳过：MVU 变量在自动诊断运行期间被改动（可能是其他脚本 / 扩展所为），诊断模式的修改未写入。${diagCoWriteDroppedLine(scoped)}`;
+        }
         const why = {
-            stateMoved: '状态在诊断期间被改动过（另一次写入 / 新回复）',
             chatSwitched: '聊天已切换',
             gone: '目标回复已不在了',
         }[detail] || '目标已失效';
         return `⏭️ 自动诊断${t} —— 已跳过：${why}，未写入。`;
     }
     return `🩺 自动诊断${t} —— 已检查最新回复，本回合无需改动。`;   // nochange
+}
+
+// 纯函数（1.83.0 🧩 并写）：被裁掉的 op 点名成一行；没裁掉任何一条 → 空串（老记录逐字节不动）。
+// 【文案待 Prince 定】可单测。
+function diagCoWriteDroppedLine(scoped) {
+    const d = (scoped && Array.isArray(scoped.dropped)) ? scoped.dropped : [];
+    if (!d.length) return '';
+    const paths = d.map((x) => (x && x.path) || '（无路径）').join('、');
+    return `\n（有 ${d.length} 条与其他脚本的改动冲突，已跳过：${paths}）`;
 }
 
 // 纯函数：拼一条自动【校正】侧聊记录的正文（仿 autoDiagNoteContent）。status: fixed（已校正、已作为新
@@ -17763,6 +17902,7 @@ function notifyAutoDiagnose(result, patch, writeBack, opts) {
             zero: result && result.zero,
             repair: result && result.repair,
             blocks: result && result.blocks,   // 1.68.0：双区块那一支要报出「几块」
+            scoped: result && result.scoped,   // 1.83.0 🧩 并写：被裁掉的 op 点名（缺席 = 记录逐字节同旧）
             // Task 7（审计簇 D）：落点提示【在这里现算】——记录是持久物、会在很久以后被重画，
             // 那时的最末楼早不是写入时那一楼了。只有真写进去的那一轮才算它。
             notice: status === 'applied' ? diagUserFloorNotice() : '',
@@ -18594,7 +18734,7 @@ function buildWindow() {
             <details class="so-mode-collapse" id="so-diag-collapse" open>
                 <summary class="so-mode-collapse-sum"><i class="fa-solid fa-stethoscope"></i><span>诊断设置</span></summary>
                 <div class="so-mode-collapse-body">
-            ${ENABLE_AUTO_DIAGNOSE ? '<label class="so-check so-lb-check"><input id="so-diag-auto" type="checkbox"><span>自动诊断每条新回复（后台自动检查并修复 MVU）</span></label>\n            <div class="so-hint">每收到一条新的 AI 回复就在后台检查其中的变量更新，发现问题自动修复，并在诊断记录里留一条可撤销的记录。窗口关着也照常工作——诊断按钮变红就表示它在后台跑着。每条回复会多发一次模型请求。</div>\n            <label class="so-check so-lb-check"><input id="so-diag-mvu-compat" type="checkbox"><span>⏳ 兼容 MVU「额外模型解析」</span></label>\n            <div class="so-hint">只有同时使用自动诊断与 TavernHelper / MVU 的「额外模型解析」时才勾选。每条 AI 回复先观察 4 秒启动窗；一旦外部解析启动，会等完整重试批次结束。成功写出更新块就核验；失败或没有有效更新块，就由自动诊断照常推导。最多等 10 分钟，仍未收尾则本轮安全跳过、不抢写。若自动校正也开启，它会在落新 swipe 前共享这次等待并合并更新块。</div>\n            <label class="so-check so-lb-check"><input id="so-diag-retry" type="checkbox"><span>🔁 失败自动重试</span></label>\n            <div class="so-hint">自动诊断这一轮没跑成时自动再试（每次重试都会重新读取当前状态、再发一次模型请求）。在下方勾选哪些失败情形需要重试；成功、无需改动、以及安全跳过（切聊天 / 状态已变 / 手动中断）永不重试。</div>\n            <div id="so-diag-retry-opts">\n            <label class="so-field"><span>最多重试次数</span><input id="so-diag-retry-count" type="number" step="1" min="1" max="99"></label>\n            <label class="so-check so-lb-check"><input id="so-diag-retry-empty" type="checkbox"><span>空白回复（模型没返回内容）</span></label>\n            <label class="so-check so-lb-check"><input id="so-diag-retry-format" type="checkbox"><span>格式错误（没能读懂 / 拒收模型给的更新）</span></label>\n            <label class="so-check so-lb-check"><input id="so-diag-retry-error" type="checkbox"><span>调用失败（网络错误 / 超时等）</span></label>\n            </div>' : ''}
+            ${ENABLE_AUTO_DIAGNOSE ? '<label class="so-check so-lb-check"><input id="so-diag-auto" type="checkbox"><span>自动诊断每条新回复（后台自动检查并修复 MVU）</span></label>\n            <div class="so-hint">每收到一条新的 AI 回复就在后台检查其中的变量更新，发现问题自动修复，并在诊断记录里留一条可撤销的记录。窗口关着也照常工作——诊断按钮变红就表示它在后台跑着。每条回复会多发一次模型请求。</div>\n            <label class="so-check so-lb-check"><input id="so-diag-mvu-compat" type="checkbox"><span>⏳ 兼容 MVU「额外模型解析」</span></label>\n            <div class="so-hint">只有同时使用自动诊断与 TavernHelper / MVU 的「额外模型解析」时才勾选。每条 AI 回复先观察 4 秒启动窗；一旦外部解析启动，会等完整重试批次结束。成功写出更新块就核验；失败或没有有效更新块，就由自动诊断照常推导。最多等 10 分钟，仍未收尾则本轮安全跳过、不抢写。若自动校正也开启，它会在落新 swipe 前共享这次等待并合并更新块。</div>\n            <label class="so-check so-lb-check"><input id="so-diag-cowrite" type="checkbox"><span>🧩 允许与其他脚本并写 MVU</span></label>\n            <div class="so-hint">某些卡脚本 / 扩展会在诊断期间改写 MVU。勾选后自动诊断仍会执行，但只写入未被改动的值，被改动的值跳过不写。</div>\n            <label class="so-check so-lb-check"><input id="so-diag-retry" type="checkbox"><span>🔁 失败自动重试</span></label>\n            <div class="so-hint">自动诊断这一轮没跑成时自动再试（每次重试都会重新读取当前状态、再发一次模型请求）。在下方勾选哪些失败情形需要重试；成功、无需改动、以及安全跳过（切聊天 / 状态已变 / 手动中断）永不重试。</div>\n            <div id="so-diag-retry-opts">\n            <label class="so-field"><span>最多重试次数</span><input id="so-diag-retry-count" type="number" step="1" min="1" max="99"></label>\n            <label class="so-check so-lb-check"><input id="so-diag-retry-empty" type="checkbox"><span>空白回复（模型没返回内容）</span></label>\n            <label class="so-check so-lb-check"><input id="so-diag-retry-format" type="checkbox"><span>格式错误（没能读懂 / 拒收模型给的更新）</span></label>\n            <label class="so-check so-lb-check"><input id="so-diag-retry-error" type="checkbox"><span>调用失败（网络错误 / 超时等）</span></label>\n            </div>' : ''}
             ${ENABLE_DIAG_BODY_INJECT ? '<label class="so-check so-lb-check"><input id="so-diag-inject" type="checkbox"><span>把诊断修正写进正文 —— 开启后，诊断的修正（自动与手动）会写进这条回复的更新区块——撤销时一并移除。</span></label>' : ''}
             <label class="so-check so-lb-check"><input id="so-diag-preset" type="checkbox"><span>套用我的补全预设（诊断指令叠加其上）</span></label>
             <div class="so-hint so-diag-preset-warn">⚠ 仅在诊断确实被模型拒绝时才勾选：预设的额外内容会分散模型注意力、影响诊断精度。</div>
@@ -19489,6 +19629,7 @@ function bindControls() {
     if (ENABLE_BBS_BRIDGE) bind('#so-bbs', 'chatIncludeBbs');   // 柏宝书记忆桥（行仅在开关开时渲染）
     if (ENABLE_LWB_BRIDGE) bind('#so-lwb', 'chatIncludeLwb');   // 小白X 记忆桥（行仅在开关开时渲染）
     if (ENABLE_AUTO_DIAGNOSE) bind('#so-diag-mvu-compat', 'autoDiagnoseMvuCompat');   // MVU external-analysis compatibility (opt-in)
+    if (ENABLE_AUTO_DIAGNOSE) bind('#so-diag-cowrite', 'autoDiagnoseCoWrite');         // 🧩 允许与其他脚本并写 MVU（1.83.0，opt-in）
     if (ENABLE_AUTO_DIAGNOSE) {   // 🔁 失败自动重试（2026-08-28）：主开关 + 次数 + 三枚分类
         bind('#so-diag-retry', 'autoDiagnoseRetry');
         win.querySelector('#so-diag-retry').addEventListener('change', () => reflectDiagRetryVisible());
@@ -19933,6 +20074,7 @@ function loadSettingsIntoForm() {
     if (ENABLE_BBS_BRIDGE) win.querySelector('#so-bbs').checked = !!s.chatIncludeBbs;   // 柏宝书记忆桥
     if (ENABLE_LWB_BRIDGE) win.querySelector('#so-lwb').checked = !!s.chatIncludeLwb;   // 小白X 记忆桥
     if (ENABLE_AUTO_DIAGNOSE) win.querySelector('#so-diag-mvu-compat').checked = !!s.autoDiagnoseMvuCompat;   // MVU external-analysis compatibility
+    if (ENABLE_AUTO_DIAGNOSE) win.querySelector('#so-diag-cowrite').checked = !!s.autoDiagnoseCoWrite;         // 🧩 允许与其他脚本并写 MVU（1.83.0）
     if (ENABLE_AUTO_DIAGNOSE) {   // 🔁 失败自动重试（2026-08-28）
         win.querySelector('#so-diag-retry').checked = !!s.autoDiagnoseRetry;
         // 次数经 diagRetryMax（与运行时同一枚消毒器）回画：存档里的胡话 / 越界值不原样上屏。
@@ -22858,44 +23000,69 @@ function filterBldBooks(q) {
     if (empty) empty.hidden = !(anyRow && !anyVisible);
 }
 
-// 某本书当前渲染出的全部条目 uid（不论勾选状态）。
-function allBldEntryUidsForBook(book) {
+// 某本书当前渲染出的条目 uid。enabledOnly＝只收【启用】行（data-type !== 'off'）——从 null 态
+// 材料化出一份 Set 时必须用它：null 的含义是「全部启用的」，材料化要还原的正是那一份，
+// 否则用户第一次撤勾就会把整本的禁用条目一并变成「显式勾上」（1.82.0）。
+function allBldEntryUidsForBook(book, enabledOnly) {
     const uids = [];
     for (const row of win.querySelectorAll('#so-bld-entry-list .so-lb-ent')) {
         if ((row.dataset.book || '') !== (book || '')) continue;
+        if (enabledOnly && row.dataset.type === 'off') continue;
         const box = row.querySelector('input[type="checkbox"]');
         if (box) uids.push(Number(box.dataset.uid));
     }
     return uids;
 }
 
-// 当前渲染出的每本书 -> 条目行数。
-function bldShownBookTotals() {
-    const totals = new Map();
+// 当前渲染出的每一行 -> { book, uid, tok, enabled }。计数 / 折叠 / 体积求和共用这一份映射
+// （1.82.0；体积读数照 1.62.0 的 lbShownEntryCosts 同款把成本挂在行上，勾选时不必重读整本书）。
+function bldShownEntryRows() {
+    const out = [];
     for (const row of win.querySelectorAll('#so-bld-entry-list .so-lb-ent')) {
-        const b = row.dataset.book || '';
-        totals.set(b, (totals.get(b) || 0) + 1);
+        const box = row.querySelector('input[type="checkbox"]');
+        if (!box) continue;
+        out.push({
+            book: row.dataset.book || '', uid: Number(box.dataset.uid),
+            tok: Number(row.dataset.tok) || 0, enabled: row.dataset.type !== 'off',
+        });
     }
-    return totals;
+    return out;
 }
 
-// 跨所有已展示的书重算摘要；某书的 Set 覆盖其全部展示条目时回落 null（＝整本，重新发送全书）。
+// 跨所有已展示的书重算摘要。某书的 Set 恰好等于它的【启用集】时折回 null（＝跟随启用状态）；
+// 多勾了禁用条目 / 少勾了启用条目都保持显式 —— 判据只有 bldSelCollapses 一处（1.82.0）。
 function refreshBldEntriesSummary() {
-    const totals = bldShownBookTotals();
+    const rows = bldShownEntryRows();
+    const totals = new Map();   // book -> { total, enabled: [uid] }
+    for (const r of rows) {
+        let t = totals.get(r.book);
+        if (!t) { t = { total: 0, enabled: [] }; totals.set(r.book, t); }
+        t.total++;
+        if (r.enabled) t.enabled.push(r.uid);
+    }
     let total = 0;
     let selected = 0;
     let anyFiltered = false;
     for (const [book, t] of totals) {
-        const sel = bldEntryFilter[book];
-        if (sel instanceof Set && t > 0 && sel.size >= t) bldEntryFilter[book] = null;
+        if (bldSelCollapses(bldEntryFilter[book], t.enabled)) bldEntryFilter[book] = null;
         const now = bldEntryFilter[book];
-        total += t;
+        total += t.total;
         if (now instanceof Set) { selected += now.size; anyFiltered = true; }
-        else selected += t;
+        else selected += t.enabled.length;
     }
     const summary = win.querySelector('#so-bld-entries-sum');
     if (!summary) return;
-    summary.textContent = anyFiltered ? `条目：已选 ${selected} / ${total}` : (total ? `条目：全部（${total}）` : '条目：全部发送');
+    // 体积读数（1.82.0，照搬 1.62.0 的世界书汇总行）：**求和排在上面的折叠归一之后**，否则
+    // 读数与条数各说各话。拆两个 span 只为让估算那一段能单独标红；两段都走 textContent。
+    const tok = sumBldSelectedTokens(rows, bldEntryFilter);
+    const countEl = document.createElement('span');
+    countEl.textContent = bldEntriesCountText(total, selected, anyFiltered) + ' · ';
+    const sizeEl = document.createElement('span');
+    sizeEl.className = 'so-lb-size' + (lbSizeIsHuge(tok) ? ' so-lb-size-huge' : '');
+    sizeEl.textContent = formatLbSizeEstimate(tok);
+    summary.textContent = '';
+    summary.appendChild(countEl);
+    summary.appendChild(sizeEl);
 }
 
 // 纯函数：把内存的 bldEntryFilter（书名 -> Set<uid> | null）序列化成可持久化的普通对象
@@ -22917,7 +23084,8 @@ function persistBldEntrySel() {
 
 function toggleBldEntry(book, uid, checked) {
     let sel = bldEntryFilter[book];
-    if (!(sel instanceof Set)) sel = new Set(allBldEntryUidsForBook(book)); // was "all" -> materialize
+    // null（＝全部启用的）→ 材料化成【启用集】，与屏幕上的勾选态逐条一致（1.82.0）
+    if (!(sel instanceof Set)) sel = new Set(allBldEntryUidsForBook(book, true));
     if (checked) sel.add(uid); else sel.delete(uid);
     bldEntryFilter[book] = sel;
     refreshBldEntriesSummary();
@@ -22925,14 +23093,19 @@ function toggleBldEntry(book, uid, checked) {
 }
 
 // 全选 / 全不选，跨所有展示的书（每本书各自一份 filter 记录）。
+// 「全选」把**每一行**（含禁用）都打上勾，所以它必须落成【显式全集】而不是 null——null 的含义已是
+// 「全部启用的」，落 null 会让屏幕上勾着的禁用行不被发送（1.82.0 WYSIWYG）。无禁用条目的书里
+// 显式全集恰等于启用集，refreshBldEntriesSummary 会自然把它折回 null，行为与从前一致。
 function setAllBldEntries(on) {
-    const books = new Set();
+    const perBook = new Map();   // book -> Set of uids（on=false 时留空集 = 一条不发）
     for (const row of win.querySelectorAll('#so-bld-entry-list .so-lb-ent')) {
         const box = row.querySelector('input[type="checkbox"]');
         if (box) box.checked = on;
-        books.add(row.dataset.book || '');
+        const b = row.dataset.book || '';
+        if (!perBook.has(b)) perBook.set(b, new Set());
+        if (on && box) perBook.get(b).add(Number(box.dataset.uid));
     }
-    for (const b of books) bldEntryFilter[b] = on ? null : new Set();   // all | none, per book
+    for (const [b, sel] of perBook) bldEntryFilter[b] = sel;
     refreshBldEntriesSummary();
     persistBldEntrySel();
 }
@@ -23020,15 +23193,20 @@ async function populateBuilderEntries() {
     let selPruned = false;   // T12：真剪掉过失效 uid 时才回写设置（末尾折叠后一次）
     for (const name of books) {
         let entries = [];
+        let loadOk = false;   // 【只有真读到了这本书】才敢按它剪除选择——见下（同 populateLorebookEntries，1.40.1）
         try {
             const data = mod ? await mod.loadWorldInfo(name) : null;
             if (data && data.entries) {
                 entries = Object.values(data.entries)
                     .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)));
+                loadOk = true;
             }
         } catch (e) { /* leave empty */ }
         // Drop stale uids from a prior selection (entries may have changed since).
-        if (bldEntryFilter[name] instanceof Set) {
+        // ⚠ 必须 loadOk 才剪（1.82.0 补）：读书失败 / 模块拿不到时 entries 是空数组，无条件剪会把整份
+        // 选择削成【空 Set＝一条不发】。工坊的选择是持久化的（bldEntrySel）——多本书同屏时这一趟就会
+        // 把坏掉那本写成 []，一次偶发读取失败便永久毁掉用户攒的选择。读不到就原样保留，下次读到再剪。
+        if (loadOk && bldEntryFilter[name] instanceof Set) {
             const valid = new Set(entries.map((e) => e.uid));
             const before = bldEntryFilter[name];
             const kept = new Set([...before].filter((u) => valid.has(u)));
@@ -23066,9 +23244,10 @@ async function populateBuilderEntries() {
                 continue;
             }
         }
-        const sel = bldEntryFilter[name];   // Set | null (= all)
+        const sel = bldEntryFilter[name];   // Set（显式选择）| null（= 全部启用的）
         for (const e of entries) {
-            const checked = !(sel instanceof Set) || sel.has(e.uid);
+            // 1.82.0：null 态下禁用条目渲染成【未勾选】——勾选框显示的就是发出去的（bldPickFedEntries 同一口径）。
+            const checked = sel instanceof Set ? sel.has(e.uid) : !e.disable;
             const title = (e.comment && e.comment.trim()) ? e.comment.trim() : '（无标题）';
             const keys = Array.isArray(e.key) ? e.key.filter(Boolean).join(', ') : '';
             const typeKey = e.disable ? 'off' : (e.constant ? 'blue' : 'green');
@@ -23077,6 +23256,8 @@ async function populateBuilderEntries() {
             row.dataset.book = name;
             row.dataset.hay = `${grouped ? name + ' ' : ''}${e.uid} ${title} ${keys}`.toLowerCase();
             row.dataset.type = typeKey;
+            // 体积读数（1.82.0）：这一条真发出去要多少 token，建行时算一次挂在行上（同 1.62.0 世界书选择器）。
+            row.dataset.tok = String(lbEntryTokenCost(e));
             row.innerHTML = `<input type="checkbox" data-uid="${e.uid}"${checked ? ' checked' : ''}>` +
                 `<span class="so-lb-ent-type so-lb-type-${typeKey}"></span>` +
                 `<span class="so-lb-ent-uid">#${e.uid}</span><span class="so-lb-ent-title"></span>`;
@@ -26873,6 +27054,7 @@ async function generateReply() {
 
     try {
         let finalText = '';
+        soLastFinishReason = '';   // FIX 4：每轮复位，防上一轮 finish_reason 漏进本轮空回复判据
         // Diagnose audits are long, and reasoning models spend part of the budget
         // "thinking" before any visible output — too small a cap yields an empty
         // reply (budget gone during thinking) or a patch cut off mid-token. Give
@@ -26884,7 +27066,9 @@ async function generateReply() {
             const body = {
                 model: s.model,
                 messages,
-                max_tokens: effMaxTokens,
+                // FIX 4（cause D）：gemini-3 系把思考记进 max_tokens，用户手动调到 <4096 会被思考吃光→空回复。
+                // 只对 gemini-3 且本次有效值 <4096 抬到 4096（只升不降、不落盘）。其余模型/值原样。
+                max_tokens: gemini3MaxTokensFloor(s.model, effMaxTokens),
             };
             if (s.sendTemperature) body.temperature = s.temperature;
             if (s.stream) {
@@ -26925,12 +27109,19 @@ async function generateReply() {
             // before any visible text (common with reasoning models and long Diagnose
             // audits), a Gemini safety-filter block, and PvP-style free-aggregator rate
             // limiting. .so-content is white-space:pre-wrap, so the newlines render.
-            contentEl.textContent = diagnoseMode
+            let emptyNote = diagnoseMode
                 ? '(空回复) — 审计可能把 token 预算用光了（推理也算在内）。调大设置里的「最大 token 数」，或问得更聚焦一点（比如只审某一类变量）。'
                 : '(空回复) — 端点收下了请求，但没有返回正文。常见三因：\n' +
                   '① 「最大 token 数」太小，或被模型思考占满 → 到设置里调大它再试。\n' +
                   '② 触发了 Gemini 安全过滤 → 换个说法，或开破限 / 换个模型再试。\n' +
                   '③ 公益站 PvP';
+            // FIX 4（cause D）：直连路已读到 finish_reason；若确证是「思考吃光输出预算」就给一句明确提示，压在通用三因之前
+            //（配置文件路读不到 finish_reason，soLastFinishReason 恒空 → 判据为假 → 仍走通用三因，不误报）。
+            if (isEmptyLengthReply(finalText, soLastFinishReason)) {
+                // 文案待 Prince 否决权
+                emptyNote = '本次输出额度被模型的思考过程吃光了（finish_reason=length）——请把设置里的「最大 token 数」调到 4096 以上再试。\n\n' + emptyNote;
+            }
+            contentEl.textContent = emptyNote;
             contentEl.classList.add('so-error');
             addRetryControl(assistantEl, aEntry);   // 空回复也给「↻ 重试」（与真实失败一致）
         } else {
@@ -27112,7 +27303,7 @@ async function generateReply() {
         const aborted = isUserAbort(err);
         // errChainMessage 而不是裸 err.message：profile 模式下酒馆把一切失败包成
         // 'API request failed'，真原因埋在 .cause 里（见该函数的注释）。
-        contentEl.textContent = aborted ? '(已停止)' : `错误：${errChainMessage(err)}`;
+        contentEl.textContent = aborted ? '(已停止)' : `错误：${explainProviderError(errChainMessage(err))}`;   // FIX 5：确定性 400 追加中文提示
         if (!aborted) {
             contentEl.classList.add('so-error');
             addRetryControl(assistantEl, aEntry);   // 失败（429 等）→ 常显「↻ 重试」，点它重发那一轮（不用重打）
@@ -30750,8 +30941,133 @@ function yzmShieldBody(body) {
     return messages === body.messages ? body : { ...body, messages };
 }
 
+/* ------------------------------------------------------------------ *
+ * Gemini 错误面加固（2026-09-15，_gemini-errors/REPORT.md）——出站前的纯消毒/归一层。
+ * 与柚月垫共处同一个传输咽喉（yzmShieldBody / yzmShieldMessages 之后）。
+ * ------------------------------------------------------------------ */
+
+// FIX 1（cause A）：把出站内容变成【格式良好】的 Unicode。落单代理项（伴生预设的反截断脚本在 emoji 中途截断
+// 会留下半个 emoji，如 \ud83d）+ C0（保留 \t\n\r）/C1/U+FDD0–FDEF/U+FFFE/U+FFFF 都换成 U+FFFD。宽松中转（navy）
+// 会静默修复，严格中转 / DeepSeek 直接 400。格式良好的文本逐字节不动。纯函数、可单测。
+function sanitizeOutgoingText(s) {
+    if (typeof s !== 'string' || !s) return s;
+    let out = s;
+    // 落单代理项：优先用引擎自带 toWellFormed()（配对的星平面字符不动、只替落单的）；缺席则用正则回退。
+    if (typeof out.toWellFormed === 'function') out = out.toWellFormed();
+    else out = out.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
+    // 控制符（保留制表/换行/回车）+ C1 + 非字符码点
+    out = out.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F﷐-﷯￾￿]/g, '�');
+    return out === s ? s : out;
+}
+
+// 出站消息数组：逐条把字符串 content 过 sanitizeOutgoingText；只在真有改动时新建对象/数组（引用稳定，与柚月垫同款）。
+function sanitizeMessages(messages) {
+    if (!Array.isArray(messages)) return messages;
+    let changed = false;
+    const out = messages.map((m) => {
+        if (!m || typeof m.content !== 'string') return m;
+        const c = sanitizeOutgoingText(m.content);
+        if (c === m.content) return m;
+        changed = true;
+        return { ...m, content: c };
+    });
+    return changed ? out : messages;
+}
+
+// FIX 2（cause B）：出站前合并相邻同角色回合。生成失败会把玩家楼留在 convo，反复失败堆出
+// [system,user,user,…]，而原生 Gemini / 严格中转要求 user/model 交替（宽松中转合并、严格中转 400）。
+// 只合并【连续的 user】与【连续的 assistant】——system 绝不合并、也绝不跨 system 边界合并，以保住内置破限
+// 领头的多 system 段与贴合注入（1.75）的字节钉（两者都是纯函数层、byte-pinned）。纯函数、可单测。
+function mergeAdjacentSameRole(messages, sep = '\n\n') {
+    if (!Array.isArray(messages) || messages.length < 2) return messages;
+    const out = [];
+    let changed = false;
+    for (const m of messages) {
+        const prev = out[out.length - 1];
+        const mergeable = prev && m
+            && (m.role === 'user' || m.role === 'assistant')
+            && prev.role === m.role
+            && typeof prev.content === 'string' && typeof m.content === 'string';
+        if (mergeable) {
+            out[out.length - 1] = { ...prev, content: prev.content + sep + m.content };
+            changed = true;
+        } else {
+            out.push(m);
+        }
+    }
+    return changed ? out : messages;
+}
+
+// FIX 1+2 出站咽喉：直连体（body.messages）与配置文件（messages 数组）各自的形状包装。先消毒（良构）再合并同角色。
+function normalizeOutgoingBody(body) {
+    if (!body || !Array.isArray(body.messages)) return body;
+    const messages = mergeAdjacentSameRole(sanitizeMessages(body.messages));
+    return messages === body.messages ? body : { ...body, messages };
+}
+function normalizeOutgoingMessages(messages) {
+    return mergeAdjacentSameRole(sanitizeMessages(messages));
+}
+
+// FIX 3（cause C）：把一行 SSE 的 data 载荷分类。中转会在 HTTP 200 的流里中途插一个 error 块
+// （`{choices:[{delta:{},finish_reason:"error"}],error:{message:"…high demand…",code:503}}`）再发 [DONE]。
+// 旧解析只读 delta.content、对 error 视而不见 → 用户拿到被腰斩的回复且界面无任何错误。这个纯函数让流循环认得它。
+// 返回 {done} / {skip} / {content, reasoning, error, finishReason}。纯函数、可单测。
+function classifySseData(payload) {
+    if (payload === '[DONE]') return { done: true };
+    let json;
+    try { json = JSON.parse(payload); } catch (e) { return { skip: true }; }
+    const choice = json && json.choices && json.choices[0];
+    const delta = (choice && choice.delta) ? choice.delta : {};
+    const content = typeof delta.content === 'string' ? delta.content : '';
+    const reasoning = (typeof delta.reasoning_content === 'string' ? delta.reasoning_content : '')
+        || (typeof delta.reasoning === 'string' ? delta.reasoning : '');
+    const finishReason = choice ? choice.finish_reason : undefined;
+    let error = '';
+    if (json && json.error) {
+        error = (typeof json.error === 'string')
+            ? json.error
+            : (json.error && typeof json.error.message === 'string' ? json.error.message : 'stream error');
+    } else if (finishReason === 'error') {
+        error = 'stream error';
+    }
+    return { content, reasoning, error, finishReason };
+}
+
+// FIX 4（cause D）：判「HTTP 200 但正文空/纯空白，且 finish_reason 是 length/MAX_TOKENS」。Gemini 3.x 把思考 token
+// 记进 max_tokens，顶棚太小 → 思考吃光预算 → 200 空回复（不是 400）。纯函数、可单测。
+function isEmptyLengthReply(text, finishReason) {
+    if (text && String(text).trim()) return false;
+    return /length|max_?tokens|max_output_tokens/i.test(String(finishReason || ''));
+}
+
+// FIX 4：gemini-3 系专用输出地板。思考记在 max_tokens 里，顶棚 <4096 极易被思考吃光。只对 model 命中 /gemini-3/i
+// 且当前有效值是【正数且 <4096】时，把【本次请求】抬到 4096——只升不降、不落盘、不改设置；未设 / 非法值不动。纯函数、可单测。
+function gemini3MaxTokensFloor(model, maxTokens) {
+    if (!/gemini-3/i.test(String(model || ''))) return maxTokens;
+    const n = Number(maxTokens);
+    if (!Number.isFinite(n) || n <= 0) return maxTokens;
+    return n < 4096 ? 4096 : maxTokens;
+}
+
+// FIX 5：两类确定性 400 的错误体 → 追加一句中文提示（原文照留、只在末尾追加，绝不替换；判据对【响应体文本】不对状态码）。
+// 直连 catch 里用它包 errChainMessage 的结果。纯函数、可单测。
+function explainProviderError(rawMessage) {
+    const msg = String(rawMessage == null ? '' : rawMessage);
+    const hints = [];
+    if (/Requests ending with a model turn/i.test(msg)) {
+        // 文案待 Prince 否决权
+        hints.push('Gemini 不接受以 AI 回合（assistant 预填）结尾的请求——请在预设里关掉末尾的预填块，或改用 3.1-pro / 2.5 档。');
+    }
+    if (/input token count exceeds/i.test(msg) || /Cannot truncate to/i.test(msg)) {
+        // 文案待 Prince 否决权
+        hints.push('上下文超过该模型上限——请调小「上下文深度」楼层数，或缩小世界书范围。');
+    }
+    return hints.length ? `${msg}（提示：${hints.join(' ')}）` : msg;
+}
+
 async function callDirect(url, apiKey, body, signal) {
     body = yzmShieldBody(body);   // 柚月记忆兼容垫（1.77.1）：在分流到后端转发之前垫，两条路共用
+    body = normalizeOutgoingBody(body);   // Gemini 加固（2026-09-15）：良构消毒 + 相邻同角色合并，同一咽喉
     if (getSettings().directViaBackend) return callBackendForward(url, apiKey, body, signal); // 经酒馆后端转发（避免 CORS）
     const extra = resolveExtraParams(getSettings()); // 附加参数（1.70.0）：坏文本在此抛错、绝不静默
     const res = await fetch(url, {
@@ -30765,6 +31081,7 @@ async function callDirect(url, apiKey, body, signal) {
         throw new Error(`HTTP ${res.status} ${res.statusText} ${t.slice(0, 300)}`);
     }
     const data = await res.json();
+    soLastFinishReason = data?.choices?.[0]?.finish_reason || '';   // FIX 4：留给空回复判据（cause D）
     return data?.choices?.[0]?.message?.content ?? '';
 }
 
@@ -30783,6 +31100,7 @@ function extractNonStreamContent(raw) {
 
 async function streamDirect(url, apiKey, body, signal, onDelta) {
     body = yzmShieldBody(body);   // 柚月记忆兼容垫（1.77.1）
+    body = normalizeOutgoingBody(body);   // Gemini 加固（2026-09-15）：良构消毒 + 相邻同角色合并，同一咽喉
     if (getSettings().directViaBackend) return streamBackendForward(url, apiKey, body, signal, onDelta); // 经酒馆后端转发（避免 CORS）
     const extra = resolveExtraParams(getSettings()); // 附加参数（1.70.0）：坏文本在此抛错、绝不静默
     const res = await fetch(url, {
@@ -30799,7 +31117,7 @@ async function streamDirect(url, apiKey, body, signal, onDelta) {
     const dec = new TextDecoder();
     let buf = '';
     let full = '';
-    let raw = '', sawData = false;   // raw=原始正文（供非 SSE 回退）；sawData=是否出现过 SSE 行
+    let raw = '', sawData = false, doneSeen = false, streamErr = '';   // raw=原始正文（供非 SSE 回退）；sawData=是否出现过 SSE 行
     while (true) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -30812,15 +31130,23 @@ async function streamDirect(url, apiKey, body, signal, onDelta) {
             line = line.trim();
             if (!line.startsWith('data:')) continue;
             sawData = true;
-            const payload = line.slice(5).trim();
-            if (payload === '[DONE]') return full;
-            try {
-                const json = JSON.parse(payload);
-                const delta = json?.choices?.[0]?.delta?.content || '';
-                if (delta) { full += delta; onDelta(delta); }
-            } catch (e) { /* keepalive / non-JSON line */ }
+            const cl = classifySseData(line.slice(5).trim());
+            if (cl.finishReason) soLastFinishReason = cl.finishReason;   // FIX 4：留给空回复判据
+            if (cl.error && !streamErr) streamErr = cl.error;            // FIX 3：记下首个中途 error，攒完当前内容后统一裁决
+            if (cl.done) { doneSeen = true; break; }
+            if (cl.skip) continue;
+            if (cl.content) { full += cl.content; onDelta(cl.content); }
         }
+        if (doneSeen) break;
     }
+    // FIX 3（cause C）：流里出现过 error 块 → 别静默返回被腰斩的正文；抛出去让 catch 显示错误 + 挂「↻ 重试」。
+    if (streamErr) {
+        // 文案待 Prince 否决权
+        throw new Error(full.trim()
+            ? `中转中途报错，回复可能不完整（可点 ↻ 重试）：${streamErr}`
+            : `中转报错：${streamErr}`);
+    }
+    if (doneSeen) return full;
     // 回退：整段流里从未出现 SSE 的 data: 行（端点无视了 stream:true、回了普通 JSON）→ 按普通补全解析，别返回空串。
     if (!sawData && !full) {
         const content = extractNonStreamContent(raw);
@@ -30834,6 +31160,7 @@ async function streamDirect(url, apiKey, body, signal, onDelta) {
 // content 卡在空。返回值仍是 content 全文（供 parseArcBeat / parseArcCheck 解析，与非流式完全一致）。
 async function streamDirectArc(url, apiKey, body, signal, onLive) {
     body = yzmShieldBody(body);   // 柚月记忆兼容垫（1.77.1）
+    body = normalizeOutgoingBody(body);   // Gemini 加固（2026-09-15）：良构消毒 + 相邻同角色合并，同一咽喉
     if (getSettings().directViaBackend) return streamBackendForwardArc(url, apiKey, body, signal, onLive); // 经酒馆后端转发（避免 CORS）
     const extra = resolveExtraParams(getSettings()); // 附加参数（1.70.0）：坏文本在此抛错、绝不静默
     const res = await fetch(url, { method: 'POST', headers: applyExtraHeaders(directHeaders(apiKey), extra), body: JSON.stringify({ ...applyExtraBody(body, extra), stream: true }), signal });
@@ -30843,7 +31170,7 @@ async function streamDirectArc(url, apiKey, body, signal, onLive) {
     }
     const reader = res.body.getReader();
     const dec = new TextDecoder();
-    let buf = '', full = '', reasoning = '', raw = '', sawData = false;   // raw=原始正文（供非 SSE 回退）；sawData=是否出现过 SSE 行
+    let buf = '', full = '', reasoning = '', raw = '', sawData = false, doneSeen = false, streamErr = '';   // raw=原始正文（供非 SSE 回退）；sawData=是否出现过 SSE 行
     while (true) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -30856,17 +31183,25 @@ async function streamDirectArc(url, apiKey, body, signal, onLive) {
             line = line.trim();
             if (!line.startsWith('data:')) continue;
             sawData = true;
-            const payload = line.slice(5).trim();
-            if (payload === '[DONE]') { if (onLive) onLive({ content: full, reasoning }); return full; }
-            try {
-                const d = JSON.parse(payload)?.choices?.[0]?.delta || {};
-                if (typeof d.content === 'string') full += d.content;
-                const r = (typeof d.reasoning_content === 'string' ? d.reasoning_content : '') || (typeof d.reasoning === 'string' ? d.reasoning : '');
-                if (r) reasoning += r;
-                if ((typeof d.content === 'string' && d.content) || r) { if (onLive) onLive({ content: full, reasoning }); }
-            } catch (e) { /* keepalive / 非 JSON 行 */ }
+            const cl = classifySseData(line.slice(5).trim());
+            if (cl.finishReason) soLastFinishReason = cl.finishReason;   // FIX 4：留给空回复判据
+            if (cl.error && !streamErr) streamErr = cl.error;            // FIX 3：记下首个中途 error
+            if (cl.done) { doneSeen = true; break; }
+            if (cl.skip) continue;
+            if (cl.content) full += cl.content;
+            if (cl.reasoning) reasoning += cl.reasoning;
+            if (cl.content || cl.reasoning) { if (onLive) onLive({ content: full, reasoning }); }
         }
+        if (doneSeen) break;
     }
+    // FIX 3（cause C）：流里出现过 error 块 → 抛出去（别静默返回被腰斩的正文），交给 catch 显示错误 + 挂「↻ 重试」。
+    if (streamErr) {
+        // 文案待 Prince 否决权
+        throw new Error(full.trim()
+            ? `中转中途报错，回复可能不完整（可点 ↻ 重试）：${streamErr}`
+            : `中转报错：${streamErr}`);
+    }
+    if (doneSeen) { if (onLive) onLive({ content: full, reasoning }); return full; }
     // 回退：整段流里从未出现 SSE 的 data: 行（中转无视了 stream:true、回了普通 JSON 补全）→ 按普通补全解析其 content，
     // 别再返回空串（空串 → parseArcBeat 解不出 → 黑箱「编译没成功」）。这正是「反重力 / 部分中转」会触发的情形。
     if (!sawData && !full) {
@@ -30879,6 +31214,7 @@ async function streamDirectArc(url, apiKey, body, signal, onLive) {
 
 async function callProfile(profileId, messages, maxTokens, overridePayload, signal) {
     messages = yzmShieldMessages(messages);   // 柚月记忆兼容垫（1.77.1）：配置文件路也经它包过的 fetch
+    messages = normalizeOutgoingMessages(messages);   // Gemini 加固（2026-09-15）：良构消毒 + 相邻同角色合并，同一咽喉
     const ctx = getCtx();
     // 附加参数（1.70.0）：经 overridePayload 透传三键——仅「自定义（兼容 OpenAI）」源的配置档会被
     // ST 后端读取（其余源忽略，弹窗警示行有言在先）。排在展开序前面 = 调用点显式 override 恒赢。
@@ -30895,6 +31231,7 @@ async function callProfile(profileId, messages, maxTokens, overridePayload, sign
 
 async function callProfileStream(profileId, messages, maxTokens, overridePayload, signal, onText) {
     messages = yzmShieldMessages(messages);   // 柚月记忆兼容垫（1.77.1）
+    messages = normalizeOutgoingMessages(messages);   // Gemini 加固（2026-09-15）：良构消毒 + 相邻同角色合并，同一咽喉
     const ctx = getCtx();
     const extra = resolveExtraParams(getSettings()); // 附加参数（1.70.0）：仅 custom 源配置档生效，同 callProfile
     // With stream:true, sendRequest resolves to a function that creates an
